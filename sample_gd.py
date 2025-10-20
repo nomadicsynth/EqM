@@ -39,6 +39,7 @@ from torchvision.transforms.functional import to_pil_image
 from pathlib import Path
 import torch.nn.functional as F
 import imageio
+from torch.amp import autocast
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -129,6 +130,17 @@ def main(args):
     model = DDP(model, device_ids=[device])
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     print(f"EqM Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Determine the dtype for autocast during sampling
+    if args.use_bf16:
+        autocast_dtype = torch.bfloat16
+        print("Using BF16 for inference")
+    elif args.use_amp:
+        autocast_dtype = torch.float16
+        print("Using FP16 for inference")
+    else:
+        autocast_dtype = torch.float32
+        print("Using FP32 for inference")
 
     # Prepare models for training:
     model.train()  # important! This enables embedding dropout for classifier-free guidance
@@ -195,20 +207,24 @@ def main(args):
                 model_kwargs = dict(y=y)
             xt = z
             m = torch.zeros_like(xt).to(xt).to(device)
-            for i in range(args.num_sampling_steps-1):
-                if args.sampler == 'gd':
-                    out = model_fn(xt, t, y, args.cfg_scale)
-                    if not torch.is_tensor(out):
-                        out = out[0]
-                if args.sampler == 'ngd':
-                    x_ = xt + args.stepsize*m*args.mu
-                    out = model_fn(x_, t, y, args.cfg_scale)
-                    if not torch.is_tensor(out):
-                        out = out[0]
-                    m = out
-                
-                xt = xt + out*args.stepsize
-                t += args.stepsize
+            
+            # Use autocast for the sampling loop
+            with autocast(device_type='cuda', dtype=autocast_dtype, enabled=args.use_amp or args.use_bf16):
+                for i in range(args.num_sampling_steps-1):
+                    if args.sampler == 'gd':
+                        out = model_fn(xt, t, y, args.cfg_scale)
+                        if not torch.is_tensor(out):
+                            out = out[0]
+                    if args.sampler == 'ngd':
+                        x_ = xt + args.stepsize*m*args.mu
+                        out = model_fn(x_, t, y, args.cfg_scale)
+                        if not torch.is_tensor(out):
+                            out = out[0]
+                        m = out
+                    
+                    xt = xt + out*args.stepsize
+                    t += args.stepsize
+            
             if use_cfg:
                 xt, _ = xt.chunk(2, dim=0)
             if getattr(args, 'video', False):
@@ -274,6 +290,8 @@ if __name__ == "__main__":
     parser.add_argument("--video", action="store_true", help="Enable video sampling mode")
     parser.add_argument("--clip-len", type=int, default=16, help="Number of frames per video clip")
     parser.add_argument("--decode-batch-size", type=int, default=64, help="Batch size for VAE decoding")
+    parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision inference (FP16)")
+    parser.add_argument("--use-bf16", action="store_true", help="Enable bfloat16 mixed precision inference (BF16)")
     parse_transport_args(parser)
     args = parser.parse_args()
     main(args)

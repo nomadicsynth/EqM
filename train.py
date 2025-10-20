@@ -38,6 +38,7 @@ import torchvision.transforms.functional as TF
 from torchvision.transforms.functional import to_pil_image
 from pathlib import Path
 import torch.nn.functional as F
+from torch.amp import autocast, GradScaler
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -175,6 +176,14 @@ def main(args):
     # Note that parameter initialization is done within the EqM constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    
+    # Setup mixed precision training
+    scaler = GradScaler('cuda', enabled=args.use_amp)
+    # Determine the dtype for autocast
+    if args.use_bf16:
+        autocast_dtype = torch.bfloat16
+    else:
+        autocast_dtype = torch.float16 if args.use_amp else torch.float32
 
     if args.ckpt is not None:
         ckpt_path = args.ckpt
@@ -201,6 +210,14 @@ def main(args):
     transport_sampler = Sampler(transport)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"EqM Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Log mixed precision configuration
+    if args.use_bf16:
+        logger.info("Mixed precision training enabled with BF16")
+    elif args.use_amp:
+        logger.info("Mixed precision training enabled with FP16")
+    else:
+        logger.info("Training in FP32 (no mixed precision)")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
 
@@ -299,12 +316,18 @@ def main(args):
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            
             model_kwargs = dict(y=y, return_act=args.disp, train=True)
-            loss_dict = transport.training_losses(model, x, model_kwargs)
-            loss = loss_dict["loss"].mean()
+            
+            # Use automatic mixed precision if enabled
+            with autocast(device_type='cuda', dtype=autocast_dtype, enabled=args.use_amp or args.use_bf16):
+                loss_dict = transport.training_losses(model, x, model_kwargs)
+                loss = loss_dict["loss"].mean()
+            
             opt.zero_grad()
-            loss.backward()
-            opt.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             update_ema(ema, model.module)
 
             # Log loss values:
@@ -380,6 +403,8 @@ if __name__ == "__main__":
     parser.add_argument("--video", action="store_true", help="Enable video training mode")
     parser.add_argument("--clip-len", type=int, default=16, help="Number of frames per video clip")
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps (overrides epochs)")
+    parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision training (FP16)")
+    parser.add_argument("--use-bf16", action="store_true", help="Enable bfloat16 mixed precision training (BF16)")
 
     parse_transport_args(parser)
     args = parser.parse_args()
