@@ -175,8 +175,10 @@ def main(args):
 
     # Note that parameter initialization is done within the EqM constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+
+    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
-    
+
     # Setup mixed precision training
     scaler = GradScaler('cuda', enabled=args.use_amp)
     # Determine the dtype for autocast
@@ -210,7 +212,7 @@ def main(args):
     transport_sampler = Sampler(transport)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"EqM Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
+
     # Log mixed precision configuration
     if args.use_bf16:
         logger.info("Mixed precision training enabled with BF16")
@@ -218,8 +220,6 @@ def main(args):
         logger.info("Mixed precision training enabled with FP16")
     else:
         logger.info("Training in FP32 (no mixed precision)")
-
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
 
     # Setup data:
     transform = transforms.Compose([
@@ -285,7 +285,7 @@ def main(args):
     else:
         sample_model_kwargs = dict(y=ys)
         model_fn = ema.forward
-    
+
     logger.info(f"Training for {args.epochs} epochs...")
     max_train_steps = args.max_steps if args.max_steps is not None else args.epochs * len(loader)
     for epoch in tqdm(range(args.epochs), desc="Training", disable=rank != 0, unit="epoch", dynamic_ncols=True):
@@ -320,14 +320,14 @@ def main(args):
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            
+
             model_kwargs = dict(y=y, time_scale=time_scale, return_act=args.disp, train=True)
-            
+
             # Use automatic mixed precision if enabled
             with autocast(device_type='cuda', dtype=autocast_dtype, enabled=args.use_amp or args.use_bf16):
                 loss_dict = transport.training_losses(model, x, model_kwargs)
                 loss = loss_dict["loss"].mean()
-            
+
             opt.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -371,7 +371,7 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
-                
+
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
