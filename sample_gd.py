@@ -38,6 +38,7 @@ import torchvision.transforms.functional as TF
 from torchvision.transforms.functional import to_pil_image
 from pathlib import Path
 import torch.nn.functional as F
+import imageio
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -98,8 +99,12 @@ def main(args):
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
+    if getattr(args, 'video', False):
+        input_size = (args.clip_len, latent_size, latent_size)
+    else:
+        input_size = latent_size
     model = EqM_models[args.model](
-        input_size=latent_size,
+        input_size=input_size,
         num_classes=args.num_classes,
         uncond=args.uncond,
         ebm=args.ebm
@@ -141,7 +146,10 @@ def main(args):
     use_cfg = args.cfg_scale > 1.0
     # Create sampling noise:
     n = ys.size(0)
-    zs = torch.randn(n, 4, latent_size, latent_size, device=device)
+    if getattr(args, 'video', False):
+        zs = torch.randn(n, 4, args.clip_len, latent_size, latent_size, device=device)
+    else:
+        zs = torch.randn(n, 4, latent_size, latent_size, device=device)
 
     # Setup classifier-free guidance:
     if use_cfg:
@@ -159,7 +167,8 @@ def main(args):
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(args.num_fid_samples / args.global_batch_size) * args.global_batch_size)
     if rank == 0:
-        print(f"Total number of images that will be sampled: {total_samples}")
+        sample_type = "videos" if getattr(args, 'video', False) else "images"
+        print(f"Total number of {sample_type} that will be sampled: {total_samples}")
     assert total_samples % dist.get_world_size() == 0, "total_samples must be divisible by world_size"
     samples_needed_this_gpu = int(total_samples // dist.get_world_size())
     assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
@@ -170,7 +179,10 @@ def main(args):
     n = int(args.global_batch_size // dist.get_world_size())
     for i in pbar:
         with torch.no_grad():
-            z = torch.randn(n, 4, latent_size, latent_size, device=device)
+            if getattr(args, 'video', False):
+                z = torch.randn(n, 4, args.clip_len, latent_size, latent_size, device=device)
+            else:
+                z = torch.randn(n, 4, latent_size, latent_size, device=device)
             y = torch.randint(0, args.num_classes, (n,), device=device)
             t = torch.ones((n,)).to(z).to(device)
             if use_cfg:
@@ -199,16 +211,38 @@ def main(args):
                 t += args.stepsize
             if use_cfg:
                 xt, _ = xt.chunk(2, dim=0)
-            samples = vae.decode(xt / 0.18215).sample
-            samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-            for i, sample in enumerate(samples):
-                index = i * dist.get_world_size() + rank + total
-                Image.fromarray(sample).save(f"{args.folder}/{index:06d}.png")
+            if getattr(args, 'video', False):
+                # xt: (n, 4, T, H_lat, W_lat)
+                N, C, T, H_lat, W_lat = xt.shape
+                xt_frames = xt.permute(0, 2, 1, 3, 4).reshape(N * T, C, H_lat, W_lat)
+                # Decode in batches to avoid OOM
+                decoded_frames = []
+                batch_size = args.decode_batch_size  # Adjust based on GPU memory
+                for i in range(0, xt_frames.shape[0], batch_size):
+                    batch = xt_frames[i:i+batch_size]
+                    decoded = vae.decode(batch / 0.18215).sample
+                    decoded_frames.append(decoded)
+                samples = torch.cat(decoded_frames, dim=0)
+                # samples: (N*T, 3, H, W)
+                samples = samples.reshape(N, T, 3, args.image_size, args.image_size)
+                # permute to (N, T, H, W, 3) for imageio
+                samples = samples.permute(0, 1, 3, 4, 2)
+                samples = torch.clamp(127.5 * samples + 128.0, 0, 255).to("cpu", dtype=torch.uint8).numpy()
+                for i, video in enumerate(samples):
+                    index = i * dist.get_world_size() + rank + total
+                    imageio.mimsave(f"{args.folder}/{index:06d}.gif", video, fps=8)
+            else:
+                samples = vae.decode(xt / 0.18215).sample
+                samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+                for i, sample in enumerate(samples):
+                    index = i * dist.get_world_size() + rank + total
+                    Image.fromarray(sample).save(f"{args.folder}/{index:06d}.png")
         total += args.global_batch_size
         dist.barrier()
     if rank == 0:
-        print("Creating .npz file")
-        create_npz_from_sample_folder(args.folder, 50000)
+        if not getattr(args, 'video', False):
+            print("Creating .npz file")
+            create_npz_from_sample_folder(args.folder, 50000)
         print("Done!")
     cleanup()
 
@@ -237,6 +271,9 @@ if __name__ == "__main__":
                         help="disable/enable noise conditioning")
     parser.add_argument("--ebm", type=str, choices=["none", "l2", "dot", "mean"], default="none",
                         help="energy formulation")
+    parser.add_argument("--video", action="store_true", help="Enable video sampling mode")
+    parser.add_argument("--clip-len", type=int, default=16, help="Number of frames per video clip")
+    parser.add_argument("--decode-batch-size", type=int, default=64, help="Batch size for VAE decoding")
     parse_transport_args(parser)
     args = parser.parse_args()
     main(args)

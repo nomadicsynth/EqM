@@ -4,6 +4,7 @@
 """
 Functions for downloading pre-trained EqM models
 """
+import argparse
 from torchvision.datasets.utils import download_url
 import torch
 import os
@@ -20,7 +21,8 @@ def find_model(model_name):
         return download_model(model_name)
     else:  
         assert os.path.isfile(model_name), f'Could not find EqM checkpoint at {model_name}'
-        checkpoint = torch.load(model_name, map_location=lambda storage, loc: storage)
+        with torch.serialization.safe_globals([argparse.Namespace]):
+            checkpoint = torch.load(model_name, map_location=lambda storage, loc: storage)
         # if "ema" in checkpoint:  # supports checkpoints from train.py
         #     checkpoint = checkpoint["ema"]
         return checkpoint
