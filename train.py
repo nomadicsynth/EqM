@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
+from video_dataset import VideoDataset
 import numpy as np
 from collections import OrderedDict
 from PIL import Image
@@ -150,9 +151,9 @@ def main(args):
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
 
-        entity = os.environ["ENTITY"]
-        project = os.environ["PROJECT"]
-        if args.wandb:
+        entity = os.environ.get("ENTITY")
+        project = os.environ.get("PROJECT")
+        if args.wandb and entity and project:
             wandb_utils.initialize(args, entity, experiment_name, project)
     else:
         logger = create_logger(None)
@@ -160,8 +161,12 @@ def main(args):
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
+    if getattr(args, 'video', False):
+        input_size = (args.clip_len, latent_size, latent_size)
+    else:
+        input_size = latent_size
     model = EqM_models[args.model](
-        input_size=latent_size,
+        input_size=input_size,
         num_classes=args.num_classes,
         uncond=args.uncond,
         ebm=args.ebm
@@ -206,7 +211,10 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    if getattr(args, 'video', False):
+        dataset = VideoDataset(args.data_path, split='train', clip_len=args.clip_len, transform=transform)
+    else:
+        dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -223,7 +231,10 @@ def main(args):
         pin_memory=True,
         drop_last=True
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    if isinstance(dataset, VideoDataset):
+        logger.info(f"Dataset contains {len(dataset):,} videos ({args.data_path})")
+    else:
+        logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
@@ -241,7 +252,11 @@ def main(args):
     use_cfg = args.cfg_scale > 1.0
     # Create sampling noise:
     n = ys.size(0)
-    zs = torch.randn(n, 4, latent_size, latent_size, device=device)
+    if getattr(args, 'video', False):
+        # video latents will have shape (N, C, T, latent, latent)
+        zs = torch.randn(n, 4, args.clip_len, latent_size, latent_size, device=device)
+    else:
+        zs = torch.randn(n, 4, latent_size, latent_size, device=device)
 
     # Setup classifier-free guidance:
     if use_cfg:
@@ -255,15 +270,35 @@ def main(args):
         model_fn = ema.forward
     
     logger.info(f"Training for {args.epochs} epochs...")
+    max_train_steps = args.max_steps if args.max_steps is not None else args.epochs * len(loader)
     for epoch in range(args.epochs):
+        if train_steps >= max_train_steps:
+            break
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+        for batch in loader:
+            if train_steps >= max_train_steps:
+                break
+            if getattr(args, 'video', False):
+                x, y = batch
+                # x: (N, C, T, H, W)
+                N, C, T, H, W = x.shape
+                # encode frames by flattening N*T into batch for the VAE
+                x_frames = x.permute(0, 2, 1, 3, 4).reshape(N * T, C, H, W).to(device)
+                y = torch.as_tensor(y, device=device, dtype=torch.long)
+                with torch.no_grad():
+                    lat = vae.encode(x_frames).latent_dist.sample().mul_(0.18215)
+                # reshape latents back to (N, C_latent, T, latent_H, latent_W)
+                C_lat = lat.shape[1]
+                lat = lat.reshape(N, T, C_lat, lat.shape[-2], lat.shape[-1]).permute(0, 2, 1, 3, 4)
+                x = lat
+            else:
+                x, y = batch
+                x = x.to(device)
+                y = y.to(device)
+                with torch.no_grad():
+                    # Map input images to latent space + normalize latents:
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             model_kwargs = dict(y=y, return_act=args.disp, train=True)
             loss_dict = transport.training_losses(model, x, model_kwargs)
             loss = loss_dict["loss"].mean()
@@ -342,6 +377,9 @@ if __name__ == "__main__":
                         help="disable/enable noise conditioning")
     parser.add_argument("--ebm", type=str, choices=["none", "l2", "dot", "mean"], default="none",
                         help="energy formulation")
+    parser.add_argument("--video", action="store_true", help="Enable video training mode")
+    parser.add_argument("--clip-len", type=int, default=16, help="Number of frames per video clip")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps (overrides epochs)")
 
     parse_transport_args(parser)
     args = parser.parse_args()

@@ -13,6 +13,63 @@ import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
 
+class PatchEmbed3D(nn.Module):
+    """3D patch embedding (for videos).
+
+    Splits (N, C, T, H, W) into patches of size (pt, ph, pw) and projects to embed_dim.
+    Returns (N, num_patches, embed_dim) to match the 2D PatchEmbed API.
+    """
+    def __init__(self, input_size, patch_size, in_chans=3, embed_dim=768, bias=True):
+        super().__init__()
+        # input_size: tuple (T, H, W) or int (assumed H=W and T given elsewhere)
+        if isinstance(input_size, int):
+            raise ValueError("PatchEmbed3D requires input_size as (T,H,W) tuple")
+        T, H, W = input_size
+        if isinstance(patch_size, int):
+            pt = ph = pw = patch_size
+        else:
+            pt, ph, pw = patch_size
+        self.input_size = (T, H, W)
+        self.patch_size = (pt, ph, pw)
+        self.grid_size = (T // pt, H // ph, W // pw)
+        self.num_patches = self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
+
+        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=(pt, ph, pw), stride=(pt, ph, pw), bias=bias)
+
+    def forward(self, x):
+        # x: (N, C, T, H, W)
+        x = self.proj(x)  # (N, D, T//pt, H//ph, W//pw)
+        N, D, t, h, w = x.shape
+        x = x.flatten(2).transpose(1, 2)  # (N, num_patches, D)
+        return x
+
+
+class FinalLayer3D(nn.Module):
+    """Final linear layer for 3D patches.
+    Projects hidden vectors to patch volume values: pt*ph*pw*out_channels per token.
+    """
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+        if isinstance(patch_size, int):
+            pt = ph = pw = patch_size
+        else:
+            pt, ph, pw = patch_size
+        self.pt, self.ph, self.pw = pt, ph, pw
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, pt * ph * pw * out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -163,19 +220,29 @@ class EqM(nn.Module):
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
+        # support 3D patching: if input_size is tuple (T,H,W) or patch_size is tuple length 3
+        self.is3d = (isinstance(input_size, tuple) and len(input_size) == 3) or (not isinstance(patch_size, int) and len(patch_size) == 3)
+        self.input_size = input_size
         self.num_heads = num_heads
 
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        if self.is3d:
+            # input_size expected as (T,H,W)
+            self.x_embedder = PatchEmbed3D(input_size, patch_size, in_channels, hidden_size, bias=True)
+        else:
+            self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding:
+        # Will use fixed sin-cos embedding (2D or 3D):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        if self.is3d:
+            self.final_layer = FinalLayer3D(hidden_size, patch_size, self.out_channels)
+        else:
+            self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
         self.uncond = uncond
         self.ebm = ebm
@@ -190,10 +257,20 @@ class EqM(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        if getattr(self, 'is3d', False):
+            # build 3D pos embed using input_size and grid
+            T, H, W = self.input_size
+            if isinstance(self.patch_size, int):
+                pt = ph = pw = self.patch_size
+            else:
+                pt, ph, pw = self.patch_size
+            gs_t, gs_h, gs_w = T // pt, H // ph, W // pw
+            pos_embed = get_3d_sincos_pos_embed(self.pos_embed.shape[-1], (gs_t, gs_h, gs_w))
+        else:
+            pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        # Initialize patch_embed conv weights (2D or 3D):
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
@@ -217,19 +294,30 @@ class EqM(nn.Module):
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
+        """Reconstruct images or videos from patch tokens.
+
+        For 2D: x: (N, num_patches, p*p*C) -> (N, C, H, W)
+        For 3D: x: (N, num_patches, pt*ph*pw*C) -> (N, C, T, H, W)
         """
         c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
+        # get patch sizes from embedder
+        if getattr(self, 'is3d', False):
+            pt, ph, pw = self.x_embedder.patch_size
+            gs_t, gs_h, gs_w = self.x_embedder.grid_size
+            N = x.shape[0]
+            x = x.reshape(N, gs_t, gs_h, gs_w, pt, ph, pw, c)
+            # reorder to (N, C, T, H, W)
+            x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
+            imgs = x.reshape(N, c, gs_t * pt, gs_h * ph, gs_w * pw)
+            return imgs
+        else:
+            p = self.x_embedder.patch_size[0]
+            h = w = int(x.shape[1] ** 0.5)
+            assert h * w == x.shape[1]
+            x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+            x = torch.einsum('nhwpqc->nchpwq', x)
+            imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+            return imgs
 
     def forward(self, x0, t, y, return_act=False, get_energy=False, train=False):
         """
@@ -255,19 +343,22 @@ class EqM(nn.Module):
             x, _ = x.chunk(2, dim=1)
 
         # explicit energy
-        E=0
+        E = 0
+        if self.ebm in ('l2', 'dot', 'mean'):
+            # sum over all non-batch dims
+            sum_dims = tuple(range(1, x.dim()))
         if self.ebm == 'l2':
-            E = -torch.sum(x**2, dim=(1,2,3))/2
+            E = -torch.sum(x**2, dim=sum_dims) / 2
             if E.requires_grad:
-                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0] 
+                x = torch.autograd.grad([E.sum()], [x0], create_graph=train)[0]
         if self.ebm == 'dot':
-            E = torch.sum(x*x0, dim=(1,2,3))
+            E = torch.sum(x * x0, dim=sum_dims)
             if E.requires_grad:
-                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]
+                x = torch.autograd.grad([E.sum()], [x0], create_graph=train)[0]
         if self.ebm == 'mean':
-            E = torch.sum(x*x0, dim=(1,2,3))
+            E = torch.sum(x * x0, dim=sum_dims)
             if E.requires_grad:
-                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]           
+                x = torch.autograd.grad([E.sum()], [x0], create_graph=train)[0]
         if get_energy:
             return x, -E
         if return_act: 
@@ -358,6 +449,29 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     emb_cos = np.cos(out) # (M, D/2)
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+
+def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+    """
+    grid_size: tuple (T, H, W)
+    returns: (T*H*W, embed_dim)
+    """
+    gt, gh, gw = grid_size
+    grid_t = np.arange(gt, dtype=np.float32)
+    grid_h = np.arange(gh, dtype=np.float32)
+    grid_w = np.arange(gw, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h, grid_t, indexing='xy')  # w, h, t ordering
+    grid = np.stack(grid, axis=0)  # (3, W, H, T)
+    # reshape to (3, 1, T, H, W) to reuse 1d helpers
+    grid = grid.reshape([3, -1])
+    # We'll compute separate embeddings for t,h,w and concat
+    emb_t = get_1d_sincos_pos_embed_from_grid(embed_dim // 3 * 1, grid[2])
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 3 * 1, grid[1])
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim - emb_t.shape[1] - emb_h.shape[1], grid[0])
+    emb = np.concatenate([emb_t, emb_h, emb_w], axis=1)
+    if cls_token and extra_tokens > 0:
+        emb = np.concatenate([np.zeros([extra_tokens, embed_dim]), emb], axis=0)
     return emb
 
 

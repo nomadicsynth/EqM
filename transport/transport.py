@@ -142,7 +142,10 @@ class Transport:
         
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
-        ut = ut * self.get_ct(t)[:,None,None,None] # use energy-compatible target
+        # get_ct returns shape (B,) -- reshape to broadcast over ut's remaining dimensions
+        ct = self.get_ct(t).to(ut)
+        expand_shape = (ct.shape[0],) + (1,) * (ut.ndim - 1)
+        ut = ut * ct.view(*expand_shape)  # use energy-compatible target
         model_output = model(xt, t, **model_kwargs)
         disp_loss = 0
 
