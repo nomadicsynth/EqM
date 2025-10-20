@@ -233,8 +233,21 @@ class EqM(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding (2D or 3D):
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        # Will use fixed sin-cos embedding (2D) or dynamic embedding (3D with time_scale):
+        if self.is3d:
+            # Store grid size for dynamic computation
+            if isinstance(patch_size, int):
+                pt = ph = pw = patch_size
+            else:
+                pt, ph, pw = patch_size
+            T, H, W = input_size
+            self.grid_size = (T // pt, H // ph, W // pw)
+            self.hidden_size = hidden_size
+            # Initialize with default time_scale=1.0 (frame indices)
+            pos_embed_default = get_3d_sincos_pos_embed(hidden_size, self.grid_size, time_scale=1.0)
+            self.register_buffer('pos_embed_default', torch.from_numpy(pos_embed_default).float().unsqueeze(0))
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -258,17 +271,12 @@ class EqM(nn.Module):
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
         if getattr(self, 'is3d', False):
-            # build 3D pos embed using input_size and grid
-            T, H, W = self.input_size
-            if isinstance(self.patch_size, int):
-                pt = ph = pw = self.patch_size
-            else:
-                pt, ph, pw = self.patch_size
-            gs_t, gs_h, gs_w = T // pt, H // ph, W // pw
-            pos_embed = get_3d_sincos_pos_embed(self.pos_embed.shape[-1], (gs_t, gs_h, gs_w))
+            # For 3D, pos_embed_default is already initialized in __init__
+            # No need to initialize again here
+            pass
         else:
             pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed conv weights (2D or 3D):
         w = self.x_embedder.proj.weight.data
@@ -319,7 +327,20 @@ class EqM(nn.Module):
             imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
             return imgs
 
-    def forward(self, x0, t, y, return_act=False, get_energy=False, train=False):
+    def get_pos_embed(self, time_scale=1.0):
+        """
+        Compute positional embedding based on time_scale.
+        For 3D models, this scales the temporal dimension.
+        For 2D models, returns the fixed pos_embed.
+        """
+        if self.is3d:
+            # Compute dynamic positional embedding with time scaling
+            pos_embed = get_3d_sincos_pos_embed(self.hidden_size, self.grid_size, time_scale=time_scale)
+            return torch.from_numpy(pos_embed).float().unsqueeze(0).to(self.pos_embed_default.device)
+        else:
+            return self.pos_embed
+
+    def forward(self, x0, t, y, time_scale=1.0, return_act=False, get_energy=False, train=False):
         """
         Forward pass of EqM.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -330,7 +351,8 @@ class EqM(nn.Module):
         if self.uncond: # removes noise/time conditioning by setting to 0
             t = torch.zeros_like(t)
         act = []
-        x = self.x_embedder(x0) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        pos_embed = self.get_pos_embed(time_scale)  # Get position embedding with time scaling
+        x = self.x_embedder(x0) + pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
@@ -365,14 +387,14 @@ class EqM(nn.Module):
             return x, act
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale, return_act=False, get_energy=False, train=False):
+    def forward_with_cfg(self, x, t, y, cfg_scale, time_scale=1.0, return_act=False, get_energy=False, train=False):
         """
         Forward pass of EqM, but also batches the uncondional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y, return_act=return_act, get_energy=get_energy, train=train)
+        model_out = self.forward(combined, t, y, time_scale=time_scale, return_act=return_act, get_energy=get_energy, train=train)
         if get_energy:
             x, E = model_out
             model_out=x
@@ -452,13 +474,14 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 
-def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+def get_3d_sincos_pos_embed(embed_dim, grid_size, time_scale=1.0, cls_token=False, extra_tokens=0):
     """
     grid_size: tuple (T, H, W)
+    time_scale: scaling factor for temporal dimension (in seconds per frame)
     returns: (T*H*W, embed_dim)
     """
     gt, gh, gw = grid_size
-    grid_t = np.arange(gt, dtype=np.float32)
+    grid_t = np.arange(gt, dtype=np.float32) * time_scale  # Scale by actual time
     grid_h = np.arange(gh, dtype=np.float32)
     grid_w = np.arange(gw, dtype=np.float32)
     grid = np.meshgrid(grid_w, grid_h, grid_t, indexing='xy')  # w, h, t ordering

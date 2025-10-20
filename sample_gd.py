@@ -176,6 +176,14 @@ def main(args):
 
     if rank == 0:
         os.makedirs(args.folder, exist_ok=True)
+        if getattr(args, 'video', False):
+            print(f"Generating videos at {args.target_fps} FPS with {args.clip_len} frames")
+    # Compute time_scale for video generation
+    if getattr(args, 'video', False):
+        # time_scale is seconds per frame
+        time_scale = 1.0 / args.target_fps  # e.g., 30 fps -> 0.033 sec/frame
+    else:
+        time_scale = 1.0
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(args.num_fid_samples / args.global_batch_size) * args.global_batch_size)
     if rank == 0:
@@ -201,10 +209,10 @@ def main(args):
                 z = torch.cat([z, z], 0)
                 y_null = torch.tensor([1000] * n, device=device)
                 y = torch.cat([y, y_null], 0)
-                model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+                model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, time_scale=time_scale)
                 t = torch.cat([t, t], 0)
             else:
-                model_kwargs = dict(y=y)
+                model_kwargs = dict(y=y, time_scale=time_scale)
             xt = z
             m = torch.zeros_like(xt).to(xt).to(device)
             
@@ -212,12 +220,12 @@ def main(args):
             with autocast(device_type='cuda', dtype=autocast_dtype, enabled=args.use_amp or args.use_bf16):
                 for i in range(args.num_sampling_steps-1):
                     if args.sampler == 'gd':
-                        out = model_fn(xt, t, y, args.cfg_scale)
+                        out = model_fn(xt, t, **model_kwargs)
                         if not torch.is_tensor(out):
                             out = out[0]
                     if args.sampler == 'ngd':
                         x_ = xt + args.stepsize*m*args.mu
-                        out = model_fn(x_, t, y, args.cfg_scale)
+                        out = model_fn(x_, t, **model_kwargs)
                         if not torch.is_tensor(out):
                             out = out[0]
                         m = out
@@ -246,7 +254,7 @@ def main(args):
                 samples = torch.clamp(127.5 * samples + 128.0, 0, 255).to("cpu", dtype=torch.uint8).numpy()
                 for i, video in enumerate(samples):
                     index = i * dist.get_world_size() + rank + total
-                    imageio.mimsave(f"{args.folder}/{index:06d}.gif", video, fps=8)
+                    imageio.mimsave(f"{args.folder}/{index:06d}.gif", video, fps=args.target_fps)
             else:
                 samples = vae.decode(xt / 0.18215).sample
                 samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
@@ -289,6 +297,7 @@ if __name__ == "__main__":
                         help="energy formulation")
     parser.add_argument("--video", action="store_true", help="Enable video sampling mode")
     parser.add_argument("--clip-len", type=int, default=16, help="Number of frames per video clip")
+    parser.add_argument("--target-fps", type=int, default=30, help="Target frame rate for generated videos (affects temporal dynamics)")
     parser.add_argument("--decode-batch-size", type=int, default=64, help="Batch size for VAE decoding")
     parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision inference (FP16)")
     parser.add_argument("--use-bf16", action="store_true", help="Enable bfloat16 mixed precision inference (BF16)")

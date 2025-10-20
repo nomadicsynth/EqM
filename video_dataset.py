@@ -53,16 +53,17 @@ class VideoDataset(Dataset):
         return len(self.video_paths)
 
     def _read_video_frames(self, path):
-        frames, _, _ = read_video(path, pts_unit='sec')
+        frames, _, info = read_video(path, pts_unit='sec')
         # frames: T,H,W,C as uint8 tensor
         if isinstance(frames, torch.Tensor):
             frames = frames.numpy()
-        return frames  # numpy array
+        fps = info.get('video_fps', 30.0)  # Default to 30 fps if not available
+        return frames, fps  # numpy array and fps
 
     def __getitem__(self, idx):
         path = self.video_paths[idx]
         label = self.labels_idx[idx]
-        frames = self._read_video_frames(path)  # (T, H, W, C)
+        frames, fps = self._read_video_frames(path)  # (T, H, W, C) and fps
         n_frames = frames.shape[0]
         if n_frames == 0:
             raise ValueError(f"Video {path} has no frames")
@@ -70,11 +71,15 @@ class VideoDataset(Dataset):
             # sample clip_len frames uniformly
             indices = np.linspace(0, n_frames - 1, num=self.clip_len, dtype=int)
             clip = frames[indices]
+            # Calculate actual time span of sampled frames
+            time_span = (indices[-1] - indices[0]) / fps  # in seconds
         else:
             # pad by repeating last frame
             reps = self.clip_len - n_frames
             last = frames[-1:]
             clip = np.concatenate([frames, np.repeat(last, reps, axis=0)], axis=0)
+            # Time span is the full video duration
+            time_span = (n_frames - 1) / fps if n_frames > 1 else 0.0
 
         # apply per-frame transform
         pil_frames = [Image.fromarray(f) for f in clip]
@@ -86,4 +91,4 @@ class VideoDataset(Dataset):
         else:
             proc = torch.from_numpy(clip).permute(3, 0, 1, 2).float() / 255.0
 
-        return proc, label
+        return proc, label, time_span

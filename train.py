@@ -297,12 +297,15 @@ def main(args):
             if train_steps >= max_train_steps:
                 break
             if getattr(args, 'video', False):
-                x, y = batch
-                # x: (N, C, T, H, W)
+                x, y, time_spans = batch
+                # x: (N, C, T, H, W), time_spans: (N,) in seconds
                 N, C, T, H, W = x.shape
                 # encode frames by flattening N*T into batch for the VAE
                 x_frames = x.permute(0, 2, 1, 3, 4).reshape(N * T, C, H, W).to(device)
                 y = torch.as_tensor(y, device=device, dtype=torch.long)
+                time_spans = torch.as_tensor(time_spans, device=device, dtype=torch.float32)
+                # Compute time_scale: seconds per frame
+                time_scale = (time_spans / (T - 1)).mean().item()  # Average across batch
                 with torch.no_grad():
                     lat = vae.encode(x_frames).latent_dist.sample().mul_(0.18215)
                 # reshape latents back to (N, C_latent, T, latent_H, latent_W)
@@ -313,11 +316,12 @@ def main(args):
                 x, y = batch
                 x = x.to(device)
                 y = y.to(device)
+                time_scale = 1.0  # No time scaling for 2D images
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             
-            model_kwargs = dict(y=y, return_act=args.disp, train=True)
+            model_kwargs = dict(y=y, time_scale=time_scale, return_act=args.disp, train=True)
             
             # Use automatic mixed precision if enabled
             with autocast(device_type='cuda', dtype=autocast_dtype, enabled=args.use_amp or args.use_bf16):
