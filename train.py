@@ -271,12 +271,12 @@ def main(args):
     
     logger.info(f"Training for {args.epochs} epochs...")
     max_train_steps = args.max_steps if args.max_steps is not None else args.epochs * len(loader)
-    for epoch in range(args.epochs):
+    for epoch in tqdm(range(args.epochs), desc="Training", disable=rank != 0, unit="epoch", dynamic_ncols=True):
         if train_steps >= max_train_steps:
             break
         sampler.set_epoch(epoch)
-        logger.info(f"Beginning epoch {epoch}...")
-        for batch in loader:
+        # logger.info(f"Beginning epoch {epoch}...")
+        for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True):
             if train_steps >= max_train_steps:
                 break
             if getattr(args, 'video', False):
