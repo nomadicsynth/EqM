@@ -1,6 +1,8 @@
 # Equilibrium Matching
 
-> **Fork Notice:** This is [@nomadicsynth](https://github.com/nomadicsynth)'s fork adding **video generation** capabilities. This is a **work in progress**, but early results indicate the approach is promising. Original repository: [raywang4/EqM](https://github.com/raywang4/EqM)
+> **Fork Notice:** This is [@nomadicsynth](https://github.com/nomadicsynth)'s fork adding **video generation** capabilities. This is a **work in progress**, but early results indicate the approach is promising.
+
+---
 
 ### [Paper](https://arxiv.org/abs/2510.02300) | [Project Page](https://raywang4.github.io/equilibrium_matching/)
 
@@ -15,6 +17,8 @@ We introduce Equilibrium Matching (EqM), a generative modeling framework built f
 
 We implement Equilibrium Matching on top of the [Dispersive Loss](https://github.com/raywang4/DispLoss) codebase.
 
+---
+
 ## Video Generation (WIP)
 
 This fork extends EqM to video generation. Early results on UCF-101 with 4-frame samples show the model is learning temporal dynamics. Below are sample generations from an EqM-S/4 model after 11,840 training steps:
@@ -26,7 +30,9 @@ This fork extends EqM to video generation. Early results on UCF-101 with 4-frame
 <img src="video_samples/000003.gif" width="160">
 </p>
 
-**Note:** These are very early results (4 frames each, low quality) but demonstrate that the approach is viable for temporal modeling.
+**Note:** These are very early results (4 frames each, low quality) but demonstrate that the approach is possibly viable for temporal modeling. Training is ongoing and better results will be added in the future.
+
+---
 
 ## Setup
 
