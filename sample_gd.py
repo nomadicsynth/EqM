@@ -102,14 +102,15 @@ def main(args):
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
     if getattr(args, 'video', False):
-        input_size = (args.clip_len, latent_size, latent_size)
+        input_size = (args.num_frames, latent_size, latent_size)
     else:
         input_size = latent_size
     model = EqM_models[args.model](
         input_size=input_size,
         num_classes=args.num_classes,
         uncond=args.uncond,
-        ebm=args.ebm
+        ebm=args.ebm,
+        use_rope=args.use_rope
     ).to(device)
 
     # Note that parameter initialization is done within the EqM constructor
@@ -119,11 +120,41 @@ def main(args):
         ckpt_path = args.ckpt
         state_dict = find_model(ckpt_path)
         if 'model' in state_dict.keys():
-            model.load_state_dict(state_dict["model"])
-            ema.load_state_dict(state_dict["ema"])
+            model_state = state_dict["model"]
+            ema_state = state_dict["ema"]
+            
+            # For 3D models, remove pos_embed_default if shapes don't match
+            # This is safe because pos_embed is dynamically computed via get_pos_embed()
+            if 'pos_embed_default' in model_state:
+                current_shape = model.state_dict()['pos_embed_default'].shape
+                ckpt_shape = model_state['pos_embed_default'].shape
+                if current_shape != ckpt_shape:
+                    if rank == 0:
+                        print(f"INFO: Removing pos_embed_default from checkpoint due to shape mismatch")
+                        print(f"      Checkpoint shape: {ckpt_shape}, Current model shape: {current_shape}")
+                        print(f"      This is expected when using different num_frames at inference vs training")
+                    del model_state['pos_embed_default']
+                    del ema_state['pos_embed_default']
+            
+            model.load_state_dict(model_state, strict=False)
+            ema.load_state_dict(ema_state, strict=False)
         else:
-            model.load_state_dict(state_dict)
-            ema.load_state_dict(state_dict)
+            model_state = state_dict
+            ema_state = state_dict
+            
+            # Same for single state dict format
+            if 'pos_embed_default' in model_state:
+                current_shape = model.state_dict()['pos_embed_default'].shape
+                ckpt_shape = model_state['pos_embed_default'].shape
+                if current_shape != ckpt_shape:
+                    if rank == 0:
+                        print(f"INFO: Removing pos_embed_default from checkpoint due to shape mismatch")
+                        print(f"      Checkpoint shape: {ckpt_shape}, Current model shape: {current_shape}")
+                        print(f"      This is expected when using different num_frames at inference vs training")
+                    del model_state['pos_embed_default']
+                    
+            model.load_state_dict(model_state, strict=False)
+            ema.load_state_dict(ema_state, strict=False)
 
         ema = ema.to(device)
         model = model.to(device)
@@ -160,7 +191,7 @@ def main(args):
     # Create sampling noise:
     n = ys.size(0)
     if getattr(args, 'video', False):
-        zs = torch.randn(n, 4, args.clip_len, latent_size, latent_size, device=device)
+        zs = torch.randn(n, 4, args.num_frames, latent_size, latent_size, device=device)
     else:
         zs = torch.randn(n, 4, latent_size, latent_size, device=device)
 
@@ -180,20 +211,20 @@ def main(args):
         if getattr(args, 'video', False):
             if args.video_duration is not None and args.target_fps is not None:
                 # User specified both duration and playback fps
-                time_scale = args.video_duration / (args.clip_len - 1) if args.clip_len > 1 else 0.0
+                time_scale = args.video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
                 print(f"\nVideo Generation Settings:")
-                print(f"  Frames to generate: {args.clip_len}")
+                print(f"  Frames to generate: {args.num_frames}")
                 print(f"  Content duration: {args.video_duration:.3f}s")
                 print(f"  Time scale: {time_scale:.4f} s/frame (temporal spacing in generation)")
                 print(f"  Playback FPS: {args.target_fps}")
-                print(f"  Playback duration: {args.clip_len / args.target_fps:.3f}s")
-                print(f"  Speed: {(args.clip_len / args.target_fps) / args.video_duration:.2f}x {'faster' if (args.clip_len / args.target_fps) < args.video_duration else 'slower'} than real-time")
+                print(f"  Playback duration: {args.num_frames / args.target_fps:.3f}s")
+                print(f"  Speed: {(args.num_frames / args.target_fps) / args.video_duration:.2f}x {'faster' if (args.num_frames / args.target_fps) < args.video_duration else 'slower'} than real-time")
             elif args.video_duration is not None:
                 # User specified duration only - calculate matched playback fps
-                time_scale = args.video_duration / (args.clip_len - 1) if args.clip_len > 1 else 0.0
-                args.target_fps = int(round((args.clip_len - 1) / args.video_duration))
+                time_scale = args.video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
+                args.target_fps = int(round((args.num_frames - 1) / args.video_duration))
                 print(f"\nVideo Generation Settings:")
-                print(f"  Frames to generate: {args.clip_len}")
+                print(f"  Frames to generate: {args.num_frames}")
                 print(f"  Content duration: {args.video_duration:.3f}s")
                 print(f"  Time scale: {time_scale:.4f} s/frame")
                 print(f"  Playback FPS: {args.target_fps} (calculated to match content duration)")
@@ -201,9 +232,9 @@ def main(args):
             else:
                 # Backwards compatibility: derive from target_fps
                 time_scale = 1.0 / args.target_fps
-                duration = time_scale * (args.clip_len - 1) if args.clip_len > 1 else 0.0
+                duration = time_scale * (args.num_frames - 1) if args.num_frames > 1 else 0.0
                 print(f"\nVideo Generation Settings:")
-                print(f"  Frames to generate: {args.clip_len}")
+                print(f"  Frames to generate: {args.num_frames}")
                 print(f"  Time scale: {time_scale:.4f} s/frame (from target-fps)")
                 print(f"  Content duration: {duration:.3f}s")
                 print(f"  Playback FPS: {args.target_fps}")
@@ -212,7 +243,7 @@ def main(args):
     if getattr(args, 'video', False):
         if args.video_duration is not None:
             # Use explicit duration: time_scale = total_duration / (num_frames - 1)
-            time_scale = args.video_duration / (args.clip_len - 1) if args.clip_len > 1 else 0.0
+            time_scale = args.video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
         else:
             # Derive from target FPS: time_scale = 1 / fps
             time_scale = 1.0 / args.target_fps
@@ -234,7 +265,7 @@ def main(args):
     for i in pbar:
         with torch.no_grad():
             if getattr(args, 'video', False):
-                z = torch.randn(n, 4, args.clip_len, latent_size, latent_size, device=device)
+                z = torch.randn(n, 4, args.num_frames, latent_size, latent_size, device=device)
             else:
                 z = torch.randn(n, 4, latent_size, latent_size, device=device)
             y = torch.randint(0, args.num_classes, (n,), device=device)
@@ -330,10 +361,10 @@ if __name__ == "__main__":
     parser.add_argument("--ebm", type=str, choices=["none", "l2", "dot", "mean"], default="none",
                         help="energy formulation")
     parser.add_argument("--video", action="store_true", help="Enable video sampling mode")
-    parser.add_argument("--clip-len", type=int, default=16, help="Number of frames per video clip")
+    parser.add_argument("--num-frames", type=int, default=16, help="Number of frames per video clip")
     parser.add_argument("--video-duration", type=float, default=None, 
                         help="Total duration spanned by the generated frames (in seconds). "
-                             "E.g., --clip-len 4 --video-duration 3.0 means 4 frames spanning 3 seconds (1 sec between frames).")
+                             "E.g., --num-frames 4 --video-duration 3.0 means 4 frames spanning 3 seconds (1 sec between frames).")
     parser.add_argument("--target-fps", type=int, default=None, 
                         help="Frame rate for saving the video file (affects playback speed only). "
                              "If not specified and video-duration is given, will be set to match content duration. "
@@ -341,6 +372,7 @@ if __name__ == "__main__":
     parser.add_argument("--decode-batch-size", type=int, default=64, help="Batch size for VAE decoding")
     parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision inference (FP16)")
     parser.add_argument("--use-bf16", action="store_true", help="Enable bfloat16 mixed precision inference (BF16)")
+    parser.add_argument("--use-rope", action="store_true", help="Use Rotary Position Embedding (RoPE) - must match training configuration")
     parse_transport_args(parser)
     args = parser.parse_args()
     
@@ -354,18 +386,18 @@ if __name__ == "__main__":
             args.video_duration = None
         elif args.video_duration is not None and args.target_fps is None:
             # Duration specified, no fps - calculate matching fps for real-time playback
-            if args.clip_len <= 1:
-                raise ValueError("clip_len must be > 1 when using video_duration")
-            args.target_fps = max(1, int(round(args.clip_len / args.video_duration)))
+            if args.num_frames <= 1:
+                raise ValueError("num_frames must be > 1 when using video_duration")
+            args.target_fps = max(1, int(round(args.num_frames / args.video_duration)))
             print(f"Calculated playback fps: {args.target_fps} (to match {args.video_duration}s content duration)")
         
         # Print configuration
-        time_scale = args.video_duration / (args.clip_len - 1) if args.video_duration is not None and args.clip_len > 1 else (1.0 / args.target_fps if args.target_fps else 0.04)
-        content_duration = args.video_duration if args.video_duration is not None else (time_scale * (args.clip_len - 1))
-        playback_duration = args.clip_len / args.target_fps if args.target_fps else content_duration
+        time_scale = args.video_duration / (args.num_frames - 1) if args.video_duration is not None and args.num_frames > 1 else (1.0 / args.target_fps if args.target_fps else 0.04)
+        content_duration = args.video_duration if args.video_duration is not None else (time_scale * (args.num_frames - 1))
+        playback_duration = args.num_frames / args.target_fps if args.target_fps else content_duration
         
         print(f"\nVideo Generation Configuration:")
-        print(f"  Frames: {args.clip_len}")
+        print(f"  Frames: {args.num_frames}")
         print(f"  Content duration: {content_duration:.3f}s (what the model generates)")
         print(f"  Time scale: {time_scale:.4f} s/frame (temporal spacing in model)")
         print(f"  Playback FPS: {args.target_fps}")

@@ -163,14 +163,15 @@ def main(args):
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
     if getattr(args, 'video', False):
-        input_size = (args.clip_len, latent_size, latent_size)
+        input_size = (args.num_frames, latent_size, latent_size)
     else:
         input_size = latent_size
     model = EqM_models[args.model](
         input_size=input_size,
         num_classes=args.num_classes,
         uncond=args.uncond,
-        ebm=args.ebm
+        ebm=args.ebm,
+        use_rope=args.use_rope
     ).to(device)
 
     # Note that parameter initialization is done within the EqM constructor
@@ -191,12 +192,42 @@ def main(args):
         ckpt_path = args.ckpt
         state_dict = find_model(ckpt_path)
         if 'model' in state_dict.keys():
-            model.load_state_dict(state_dict["model"])
-            ema.load_state_dict(state_dict["ema"])
+            model_state = state_dict["model"]
+            ema_state = state_dict["ema"]
+            
+            # For 3D models, remove pos_embed_default if shapes don't match
+            # This is safe because pos_embed is dynamically computed via get_pos_embed()
+            if 'pos_embed_default' in model_state:
+                current_shape = model.state_dict()['pos_embed_default'].shape
+                ckpt_shape = model_state['pos_embed_default'].shape
+                if current_shape != ckpt_shape:
+                    if rank == 0:
+                        logger.info(f"INFO: Removing pos_embed_default from checkpoint due to shape mismatch")
+                        logger.info(f"      Checkpoint shape: {ckpt_shape}, Current model shape: {current_shape}")
+                        logger.info(f"      This is expected when using different num_frames at training vs checkpoint")
+                    del model_state['pos_embed_default']
+                    del ema_state['pos_embed_default']
+            
+            model.load_state_dict(model_state, strict=False)
+            ema.load_state_dict(ema_state, strict=False)
             opt.load_state_dict(state_dict["opt"])
         else:
-            model.load_state_dict(state_dict)
-            ema.load_state_dict(state_dict)
+            model_state = state_dict
+            ema_state = state_dict
+            
+            # Same for single state dict format
+            if 'pos_embed_default' in model_state:
+                current_shape = model.state_dict()['pos_embed_default'].shape
+                ckpt_shape = model_state['pos_embed_default'].shape
+                if current_shape != ckpt_shape:
+                    if rank == 0:
+                        logger.info(f"INFO: Removing pos_embed_default from checkpoint due to shape mismatch")
+                        logger.info(f"      Checkpoint shape: {ckpt_shape}, Current model shape: {current_shape}")
+                        logger.info(f"      This is expected when using different num_frames at training vs checkpoint")
+                    del model_state['pos_embed_default']
+                    
+            model.load_state_dict(model_state, strict=False)
+            ema.load_state_dict(ema_state, strict=False)
 
         ema = ema.to(device)
         model = model.to(device)
@@ -229,7 +260,7 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
     if getattr(args, 'video', False):
-        dataset = VideoDataset(args.data_path, split='train', clip_len=args.clip_len, transform=transform)
+        dataset = VideoDataset(args.data_path, split='train', num_frames=args.num_frames, transform=transform)
     else:
         dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
@@ -271,7 +302,7 @@ def main(args):
     n = ys.size(0)
     if getattr(args, 'video', False):
         # video latents will have shape (N, C, T, latent, latent)
-        zs = torch.randn(n, 4, args.clip_len, latent_size, latent_size, device=device)
+        zs = torch.randn(n, 4, args.num_frames, latent_size, latent_size, device=device)
     else:
         zs = torch.randn(n, 4, latent_size, latent_size, device=device)
 
@@ -405,10 +436,11 @@ if __name__ == "__main__":
     parser.add_argument("--ebm", type=str, choices=["none", "l2", "dot", "mean"], default="none",
                         help="energy formulation")
     parser.add_argument("--video", action="store_true", help="Enable video training mode")
-    parser.add_argument("--clip-len", type=int, default=16, help="Number of frames per video clip")
+    parser.add_argument("--num-frames", type=int, default=16, help="Number of frames per video clip")
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps (overrides epochs)")
     parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision training (FP16)")
     parser.add_argument("--use-bf16", action="store_true", help="Enable bfloat16 mixed precision training (BF16)")
+    parser.add_argument("--use-rope", action="store_true", help="Use Rotary Position Embedding (RoPE) instead of fixed sinusoidal embeddings. Allows training with varying number of frames.")
 
     parse_transport_args(parser)
     args = parser.parse_args()

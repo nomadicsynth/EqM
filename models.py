@@ -33,6 +33,8 @@ class PatchEmbed3D(nn.Module):
         self.patch_size = (pt, ph, pw)
         self.grid_size = (T // pt, H // ph, W // pw)
         self.num_patches = self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
+        # Store spatial grid size separately for dynamic temporal inference
+        self.spatial_grid_size = (H // ph, W // pw)
 
         self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=(pt, ph, pw), stride=(pt, ph, pw), bias=bias)
 
@@ -72,6 +74,105 @@ class FinalLayer3D(nn.Module):
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+#################################################################################
+#                          Rotary Position Embedding (RoPE)                     #
+#################################################################################
+
+class RoPE3D(nn.Module):
+    """
+    3D Rotary Position Embedding for video patches.
+    Applies separate rotary embeddings for temporal, height, and width dimensions.
+    This naturally generalizes to any sequence length without retraining.
+    """
+    def __init__(self, dim, max_freq=10000, time_scale=1.0):
+        super().__init__()
+        self.dim = dim
+        self.max_freq = max_freq
+        self.time_scale = time_scale
+        
+    def forward(self, x, grid_size, time_scale=None):
+        """
+        Apply 3D RoPE to input tensor.
+        
+        Args:
+            x: (batch, num_patches, dim) tensor
+            grid_size: (t, h, w) tuple indicating patch grid dimensions
+            time_scale: optional temporal scaling factor (seconds per frame)
+        
+        Returns:
+            x with rotary position embeddings applied
+        """
+        if time_scale is None:
+            time_scale = self.time_scale
+            
+        batch_size, num_patches, dim = x.shape
+        t, h, w = grid_size
+        
+        # Split dimensions for temporal, height, width
+        # Using 1/3 of dim for each spatial dimension
+        dim_t = dim // 3
+        dim_h = dim // 3
+        dim_w = dim - dim_t - dim_h
+        
+        # Generate position indices
+        pos_t = torch.arange(t, device=x.device, dtype=torch.float32) * time_scale
+        pos_h = torch.arange(h, device=x.device, dtype=torch.float32)
+        pos_w = torch.arange(w, device=x.device, dtype=torch.float32)
+        
+        # Create meshgrid and flatten to match patch ordering
+        grid_t, grid_h, grid_w = torch.meshgrid(pos_t, pos_h, pos_w, indexing='ij')
+        positions = torch.stack([
+            grid_t.flatten(),
+            grid_h.flatten(), 
+            grid_w.flatten()
+        ], dim=1)  # (num_patches, 3)
+        
+        # Apply rotary embedding to each dimension
+        x_t, x_h, x_w = x.split([dim_t, dim_h, dim_w], dim=-1)
+        
+        x_t = self.apply_rotary_emb_1d(x_t, positions[:, 0], dim_t)
+        x_h = self.apply_rotary_emb_1d(x_h, positions[:, 1], dim_h)
+        x_w = self.apply_rotary_emb_1d(x_w, positions[:, 2], dim_w)
+        
+        return torch.cat([x_t, x_h, x_w], dim=-1)
+    
+    def apply_rotary_emb_1d(self, x, positions, dim):
+        """
+        Apply 1D rotary embedding to a subset of features.
+        
+        Args:
+            x: (batch, num_patches, dim) tensor
+            positions: (num_patches,) position indices
+            dim: feature dimension
+        """
+        # Compute frequencies
+        half_dim = dim // 2
+        freqs = torch.exp(
+            -math.log(self.max_freq) * torch.arange(0, half_dim, device=x.device, dtype=torch.float32) / half_dim
+        )
+        
+        # positions: (num_patches,), freqs: (half_dim,)
+        # Create (num_patches, half_dim) matrix of position * frequency
+        pos_freqs = positions[:, None] * freqs[None, :]  # (num_patches, half_dim)
+        
+        # Compute sin and cos
+        sin = torch.sin(pos_freqs)  # (num_patches, half_dim)
+        cos = torch.cos(pos_freqs)  # (num_patches, half_dim)
+        
+        # Split x into pairs for rotation
+        # x: (batch, num_patches, dim) -> (batch, num_patches, half_dim, 2)
+        x = x.view(x.shape[0], x.shape[1], half_dim, 2)
+        
+        # Rotate: [x0, x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]
+        x_rotated = torch.stack([
+            x[..., 0] * cos - x[..., 1] * sin,
+            x[..., 0] * sin + x[..., 1] * cos
+        ], dim=-1)
+        
+        # Reshape back
+        return x_rotated.view(x.shape[0], x.shape[1], dim)
 
 
 #################################################################################
@@ -224,7 +325,7 @@ class SiTBlock(nn.Module):
     """
     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_rope=False, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
@@ -236,10 +337,19 @@ class SiTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
+        self.use_rope = use_rope
+        if use_rope:
+            self.rope = RoPE3D(hidden_size)
 
-    def forward(self, x, c):
+    def forward(self, x, c, grid_size=None, time_scale=1.0):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        
+        # Apply RoPE before attention if enabled
+        x_normed = modulate(self.norm1(x), shift_msa, scale_msa)
+        if self.use_rope and grid_size is not None:
+            x_normed = self.rope(x_normed, grid_size, time_scale)
+        
+        x = x + gate_msa.unsqueeze(1) * self.attn(x_normed)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -281,7 +391,8 @@ class EqM(nn.Module):
         num_classes=1000,
         learn_sigma=True,
         uncond=True,
-        ebm='none'
+        ebm='none',
+        use_rope=False
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -292,6 +403,7 @@ class EqM(nn.Module):
         self.is3d = (isinstance(input_size, tuple) and len(input_size) == 3) or (not isinstance(patch_size, int) and len(patch_size) == 3)
         self.input_size = input_size
         self.num_heads = num_heads
+        self.use_rope = use_rope
 
         if self.is3d:
             # input_size expected as (T,H,W)
@@ -301,7 +413,7 @@ class EqM(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding (2D) or dynamic embedding (3D with time_scale):
+        # Will use RoPE or fixed sin-cos embedding
         if self.is3d:
             # Store grid size for dynamic computation
             if isinstance(patch_size, int):
@@ -311,14 +423,16 @@ class EqM(nn.Module):
             T, H, W = input_size
             self.grid_size = (T // pt, H // ph, W // pw)
             self.hidden_size = hidden_size
-            # Initialize with default time_scale=1.0 (frame indices)
-            pos_embed_default = get_3d_sincos_pos_embed(hidden_size, self.grid_size, time_scale=1.0)
-            self.register_buffer('pos_embed_default', torch.from_numpy(pos_embed_default).float().unsqueeze(0))
+            if not use_rope:
+                # Initialize with default time_scale=1.0 (frame indices)
+                pos_embed_default = get_3d_sincos_pos_embed(hidden_size, self.grid_size, time_scale=1.0)
+                self.register_buffer('pos_embed_default', torch.from_numpy(pos_embed_default).float().unsqueeze(0))
         else:
-            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+            if not use_rope:
+                self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_rope=use_rope) for _ in range(depth)
         ])
         if self.is3d:
             self.final_layer = FinalLayer3D(hidden_size, patch_size, self.out_channels)
@@ -379,7 +493,17 @@ class EqM(nn.Module):
         # get patch sizes from embedder
         if getattr(self, 'is3d', False):
             pt, ph, pw = self.x_embedder.patch_size
-            gs_t, gs_h, gs_w = self.x_embedder.grid_size
+            # Dynamically compute grid size from number of patches
+            num_patches = x.shape[1]
+            if self.use_rope:
+                # For RoPE, we need to infer grid size from the number of patches
+                # Spatial grid size is fixed, temporal can vary
+                gs_h, gs_w = self.x_embedder.spatial_grid_size
+                gs_t = num_patches // (gs_h * gs_w)
+                assert gs_t * gs_h * gs_w == num_patches, f"Cannot infer grid size: {num_patches} patches doesn't match grid {gs_t}x{gs_h}x{gs_w}"
+            else:
+                gs_t, gs_h, gs_w = self.x_embedder.grid_size
+            
             N = x.shape[0]
             x = x.reshape(N, gs_t, gs_h, gs_w, pt, ph, pw, c)
             # reorder to (N, C, T, H, W)
@@ -419,14 +543,43 @@ class EqM(nn.Module):
         if self.uncond: # removes noise/time conditioning by setting to 0
             t = torch.zeros_like(t)
         act = []
-        pos_embed = self.get_pos_embed(time_scale)  # Get position embedding with time scaling
-        x = self.x_embedder(x0) + pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        
+        # Embed patches
+        x = self.x_embedder(x0)  # (N, num_patches, D)
+        
+        # Add positional embedding if not using RoPE
+        if not self.use_rope:
+            pos_embed = self.get_pos_embed(time_scale)
+            x = x + pos_embed
+        
+        # Get conditioning
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
+        
+        # Get grid size for RoPE
+        if self.use_rope and self.is3d:
+            # Dynamically compute grid size from input
+            N, C, T, H, W = x0.shape
+            if isinstance(self.patch_size, int):
+                pt = ph = pw = self.patch_size
+            else:
+                pt, ph, pw = self.patch_size
+            grid_size = (T // pt, H // ph, W // pw)
+        elif self.use_rope:
+            # 2D case
+            grid_size = (int(x.shape[1] ** 0.5), int(x.shape[1] ** 0.5))
+        else:
+            grid_size = None
+        
+        # Transformer blocks
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
+            if self.use_rope:
+                x = block(x, c, grid_size=grid_size, time_scale=time_scale)
+            else:
+                x = block(x, c)
             act.append(x)
+            
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:

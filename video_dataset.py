@@ -21,12 +21,11 @@ class VideoDataset(Dataset):
 
     Returns clips of shape (C, T, H, W) and a label index.
     """
-    def __init__(self, root: str, split: str = 'train', clip_len: int = 16, transform=None, extensions=('.avi',)):
+    def __init__(self, root: str, split: str = 'train', num_frames: int = 16, transform=None, extensions=('.avi',)):
+        super().__init__()
         self.root = root
-        self.split = split
-        self.clip_len = clip_len
+        self.num_frames = num_frames
         self.transform = transform
-        self.extensions = extensions
         csv_path = os.path.join(root, f"{split}.csv")
         self.label_dict = {}
         with open(csv_path, 'r') as f:
@@ -67,15 +66,16 @@ class VideoDataset(Dataset):
         n_frames = frames.shape[0]
         if n_frames == 0:
             raise ValueError(f"Video {path} has no frames")
-        if n_frames >= self.clip_len:
-            # sample clip_len frames uniformly
-            indices = np.linspace(0, n_frames - 1, num=self.clip_len, dtype=int)
+        if n_frames >= self.num_frames:
+            # sample num_frames frames uniformly
+            indices = np.linspace(0, n_frames - 1, num=self.num_frames, dtype=int)
             clip = frames[indices]
             # Calculate actual time span of sampled frames
             time_span = (indices[-1] - indices[0]) / fps  # in seconds
         else:
             # pad by repeating last frame
-            reps = self.clip_len - n_frames
+            indices = list(range(n_frames))
+            reps = self.num_frames - n_frames
             last = frames[-1:]
             clip = np.concatenate([frames, np.repeat(last, reps, axis=0)], axis=0)
             # Time span is the full video duration
