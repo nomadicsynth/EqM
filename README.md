@@ -4,24 +4,9 @@
 
 ---
 
-### [Paper](https://arxiv.org/abs/2510.02300) | [Project Page](https://raywang4.github.io/equilibrium_matching/)
-
-<img src="eqm.png" width="700" height="700">
-This repo contains the official PyTorch implementation of Equilibrium Matching.
-
-> [**Equilibrium Matching: Generative Modeling with Implicit Energy-Based Models**](https://arxiv.org/abs/2510.02300)<br>
-> [Runqian Wang](https://raywang4.github.io/), [Yilun Du](https://yilundu.github.io/)
-> <br>MIT, Harvard<br>
-
-We introduce Equilibrium Matching (EqM), a generative modeling framework built from an equilibrium dynamics perspective. EqM discards the non-equilibrium, time-conditional dynamics in traditional diffusion and flow-based generative models and instead learns the equilibrium gradient of an implicit energy landscape. Through this approach, we can adopt an optimization-based sampling process at inference time, where samples are obtained by gradient descent on the learned landscape with adjustable step sizes, adaptive optimizers, and adaptive compute. EqM surpasses the generation performance of diffusion/flow models empirically, achieving a FID of 1.90 on ImageNet 256x256. EqM is also theoretically justified to learn and sample from the data manifold. Beyond generation, EqM is a flexible framework that naturally handles tasks including partially noised input denoising, OOD detection, and image composition. By replacing time-conditional velocities with a unified equilibrium landscape, EqM offers a tighter bridge between flow and energy-based models and a simple route to optimization-driven inference.
-
-We implement Equilibrium Matching on top of the [Dispersive Loss](https://github.com/raywang4/DispLoss) codebase.
-
----
-
 ## Video Generation (WIP)
 
-This fork extends EqM to video generation. Early results on UCF-101 with 4-frame samples show the model is learning temporal dynamics. Below are sample generations from an EqM-S/4 model after 11,840 training steps:
+This fork extends EqM to video generation. A small model (EqM-S/4) is currently being trained on UCF-101 with 4-frame samples. Early results show the model is learning. Sample generations from the model will be updated here as training progresses.
 
 ### Sample Generations
 
@@ -46,6 +31,19 @@ This fork extends EqM to video generation. Early results on UCF-101 with 4-frame
 **Note:** These are very early results (4 frames each, low quality) but demonstrate that the approach is possibly viable for temporal modeling. Training is ongoing and better results will be added in the future.
 
 ---
+
+### [Paper](https://arxiv.org/abs/2510.02300) | [Project Page](https://raywang4.github.io/equilibrium_matching/)
+
+<img src="eqm.png" width="700" height="700">
+This repo contains the official PyTorch implementation of Equilibrium Matching.
+
+> [**Equilibrium Matching: Generative Modeling with Implicit Energy-Based Models**](https://arxiv.org/abs/2510.02300)<br>
+> [Runqian Wang](https://raywang4.github.io/), [Yilun Du](https://yilundu.github.io/)
+> <br>MIT, Harvard<br>
+
+We introduce Equilibrium Matching (EqM), a generative modeling framework built from an equilibrium dynamics perspective. EqM discards the non-equilibrium, time-conditional dynamics in traditional diffusion and flow-based generative models and instead learns the equilibrium gradient of an implicit energy landscape. Through this approach, we can adopt an optimization-based sampling process at inference time, where samples are obtained by gradient descent on the learned landscape with adjustable step sizes, adaptive optimizers, and adaptive compute. EqM surpasses the generation performance of diffusion/flow models empirically, achieving a FID of 1.90 on ImageNet 256x256. EqM is also theoretically justified to learn and sample from the data manifold. Beyond generation, EqM is a flexible framework that naturally handles tasks including partially noised input denoising, OOD detection, and image composition. By replacing time-conditional velocities with a unified equilibrium landscape, EqM offers a tighter bridge between flow and energy-based models and a simple route to optimization-driven inference.
+
+We implement Equilibrium Matching on top of the [Dispersive Loss](https://github.com/raywang4/DispLoss) codebase.
 
 ## Setup
 
