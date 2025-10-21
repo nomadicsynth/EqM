@@ -6,9 +6,10 @@ A minimal sampling script for EqM using PyTorch DDP.
 """
 import math
 import torch
+
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.fp32_precision = "ieee"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
