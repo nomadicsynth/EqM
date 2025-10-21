@@ -11,12 +11,14 @@ RoPE enables training with **variable number of frames**, allowing you to progre
 ## Why RoPE?
 
 **Traditional Positional Embeddings (default):**
+
 - Fixed sinusoidal embeddings computed at model initialization
 - Tied to specific `num_frames` used during training
 - Require checkpoint surgery (removing `pos_embed_default`) to use different number of frames at inference
 - Cannot change number of frames during training without issues
 
 **RoPE (Rotary Position Embedding):**
+
 - ✅ Applied dynamically based on actual input sequence length
 - ✅ Naturally generalizes to any number of frames (≥ patch_size)
 - ✅ No fixed buffers - position encoded in attention mechanism
@@ -93,7 +95,7 @@ torchrun --nproc_per_node=1 EqM/sample_gd.py \
    - `num_frames=4`: baseline memory
    - `num_frames=8`: ~2x memory
    - `num_frames=16`: ~4x memory
-   
+
    Adjust `--global-batch-size` accordingly!
 
 ## Converting Existing Checkpoints
@@ -149,6 +151,7 @@ torchrun --nproc_per_node=8 EqM/train.py \
 ## Technical Details
 
 RoPE works by:
+
 1. Splitting the feature dimension into temporal, height, and width components (1/3 each dimension gets equal capacity)
    - This is a simple, fixed strategy that works across any number of frames
    - Temporal gets 1/3 even when grid is small (e.g., 1×8×8) because it encodes time_scale
