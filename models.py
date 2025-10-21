@@ -148,6 +148,74 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
+# For later potential experimentation
+class VideoTemporalEmbedder(nn.Module):
+    """
+    Embeds video temporal parameters (duration, fps, num_frames) into vector representations.
+    Uses continuous embeddings similar to timestep embeddings.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        # Three separate MLPs for duration, fps, and frame count
+        self.duration_mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.fps_mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frames_mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        # Combine all three embeddings
+        self.combine = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def continuous_embedding(values, dim, max_period=10000):
+        """
+        Create sinusoidal embeddings for continuous values.
+        Similar to timestep embedding but for any continuous scalar.
+        """
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=values.device)
+        args = values[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, duration, fps, num_frames):
+        """
+        Args:
+            duration: (N,) tensor of video durations in seconds
+            fps: (N,) tensor of frame rates
+            num_frames: (N,) tensor of frame counts
+        """
+        dur_freq = self.continuous_embedding(duration, self.frequency_embedding_size)
+        fps_freq = self.continuous_embedding(fps, self.frequency_embedding_size)
+        frames_freq = self.continuous_embedding(num_frames, self.frequency_embedding_size)
+        
+        dur_emb = self.duration_mlp(dur_freq)
+        fps_emb = self.fps_mlp(fps_freq)
+        frames_emb = self.frames_mlp(frames_freq)
+        
+        # Concatenate and combine
+        combined = torch.cat([dur_emb, fps_emb, frames_emb], dim=1)
+        return self.combine(combined)
+
+
 #################################################################################
 #                                 Core EqM Model                                #
 #################################################################################
