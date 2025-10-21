@@ -23,11 +23,24 @@ We implement Equilibrium Matching on top of the [Dispersive Loss](https://github
 
 This fork extends EqM to video generation. Early results on UCF-101 with 4-frame samples show the model is learning temporal dynamics. Below are sample generations from an EqM-S/4 model after 11,840 training steps:
 
+### Sample Generations
+
+#### Step 11848
+
 <p align="center">
-<img src="video_samples/000000.gif" width="160">
-<img src="video_samples/000001.gif" width="160">
-<img src="video_samples/000002.gif" width="160">
-<img src="video_samples/000003.gif" width="160">
+<img src="video_samples/045-EqM-S-4-Linear-velocity-None_checkpoint_0011840/000000.gif" width="160">
+<img src="video_samples/045-EqM-S-4-Linear-velocity-None_checkpoint_0011840/000001.gif" width="160">
+<img src="video_samples/045-EqM-S-4-Linear-velocity-None_checkpoint_0011840/000002.gif" width="160">
+<img src="video_samples/045-EqM-S-4-Linear-velocity-None_checkpoint_0011840/000003.gif" width="160">
+</p>
+
+#### Step 23696
+
+<p align="center">
+<img src="video_samples/046-EqM-S-4-Linear-velocity-None_checkpoint_0011840/000000.gif" width="160">
+<img src="video_samples/046-EqM-S-4-Linear-velocity-None_checkpoint_0011840/000001.gif" width="160">
+<img src="video_samples/046-EqM-S-4-Linear-velocity-None_checkpoint_0011840/000002.gif" width="160">
+<img src="video_samples/046-EqM-S-4-Linear-velocity-None_checkpoint_0011840/000003.gif" width="160">
 </p>
 
 **Note:** These are very early results (4 frames each, low quality) but demonstrate that the approach is possibly viable for temporal modeling. Training is ongoing and better results will be added in the future.
