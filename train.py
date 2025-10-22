@@ -222,7 +222,11 @@ def main(args):
     import warnings
     warnings.filterwarnings('ignore', message='.*barrier.*using the device under current context.*')
     dist.init_process_group("nccl")
+    
+    # Calculate effective batch size with gradient accumulation
+    effective_batch_size = args.global_batch_size * args.gradient_accumulation_steps
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    
     rank = dist.get_rank()
     device = int(os.environ["LOCAL_RANK"])
     print(f"Found {n_gpus} GPUs, trying to use device index {device}")
@@ -231,6 +235,10 @@ def main(args):
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     local_batch_size = int(args.global_batch_size // dist.get_world_size())
+    
+    if rank == 0:
+        print(f"Global batch size: {args.global_batch_size}, Gradient accumulation steps: {args.gradient_accumulation_steps}")
+        print(f"Effective batch size: {effective_batch_size}, Local batch size per GPU: {local_batch_size}")
 
     # Setup an experiment folder:
     if rank == 0:
@@ -491,6 +499,7 @@ def main(args):
     log_steps = 0
     running_loss = 0
     start_time = time()
+    accumulation_counter = 0  # Track gradient accumulation steps
 
     # Labels to condition the model with (feel free to change):
     ys = torch.randint(args.num_classes, size=(local_batch_size,), device=device)
@@ -516,6 +525,10 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs...")
     max_train_steps = args.max_steps if args.max_steps is not None else args.epochs * len(loader)
+    
+    # Initialize optimizer gradients for gradient accumulation
+    opt.zero_grad()
+    
     for epoch in tqdm(range(args.epochs), desc="Training", disable=rank != 0, unit="epoch", dynamic_ncols=True):
         if train_steps >= max_train_steps:
             break
@@ -555,19 +568,30 @@ def main(args):
             with autocast(device_type='cuda', dtype=autocast_dtype, enabled=args.use_amp or args.use_bf16):
                 loss_dict = transport.training_losses(model, x, model_kwargs)
                 loss = loss_dict["loss"].mean()
+                # Scale loss by accumulation steps for correct gradient magnitude
+                loss = loss / args.gradient_accumulation_steps
 
-            opt.zero_grad()
+            # Accumulate gradients
             scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            update_ema(ema, model.module)
-            if scheduler:
-                scheduler.step()
+            accumulation_counter += 1
+            
+            # Only step optimizer after accumulating enough gradients
+            if accumulation_counter >= args.gradient_accumulation_steps:
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad()
+                accumulation_counter = 0
+                
+                # Update EMA and scheduler only after actual optimizer step
+                update_ema(ema, model.module)
+                if scheduler:
+                    scheduler.step()
+                
+                train_steps += 1
 
-            # Log loss values:
-            running_loss += loss.item()
+            # Log loss values (use unscaled loss for logging)
+            running_loss += loss.item() * args.gradient_accumulation_steps
             log_steps += 1
-            train_steps += 1
             
             # Generate samples (check before logging to ensure correct step order):
             if args.sample_every > 0 and train_steps % args.sample_every == 0 and train_steps > 0:
@@ -819,6 +843,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-muon", action="store_true", help="Use Muon optimizer for hidden weights (2D+ params in transformer blocks)")
     parser.add_argument("--muon-lr", type=float, default=0.02, help="Learning rate for Muon optimizer")
     parser.add_argument("--muon-patch-embed", action="store_true", help="Apply Muon to patch embedding projection layer (experimental)")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Number of gradient accumulation steps (allows larger effective batch size with less VRAM)")
 
     parse_transport_args(parser)
     args = parser.parse_args()
