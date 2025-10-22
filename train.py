@@ -506,10 +506,9 @@ def main(args):
     
     # Setup signal handler for graceful shutdown on Ctrl+C
     interrupted = False
+    
     def signal_handler(signum, frame):
         nonlocal interrupted
-        if rank == 0:
-            logger.info("\nReceived interrupt signal (Ctrl+C). Saving checkpoint and exiting...")
         interrupted = True
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -847,6 +846,8 @@ def main(args):
 
     # Save final checkpoint
     if rank == 0:
+        if interrupted:
+            logger.info("Training interrupted. Saving checkpoint...")
         checkpoint = {
             "model": model.module.state_dict(),
             "ema": ema.state_dict(),
@@ -857,7 +858,7 @@ def main(args):
         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
         torch.save(checkpoint, checkpoint_path)
         if interrupted:
-            logger.info(f"Saved checkpoint after interruption to {checkpoint_path}")
+            logger.info(f"Checkpoint saved to {checkpoint_path}")
         else:
             logger.info(f"Saved final checkpoint to {checkpoint_path}")
     dist.barrier()
