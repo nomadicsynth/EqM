@@ -795,7 +795,11 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                current_lrs = [group['lr'] for group in opt.param_groups]
+                if args.use_muon and len(current_lrs) > 1:
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR_Muon: {current_lrs[0]:.6f}, LR_AdamW: {current_lrs[1]:.6f}")
+                else:
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lrs[0]:.6f}")
                 
                 # Collect all wandb metrics to log at once
                 if args.wandb:
@@ -804,6 +808,12 @@ def main(args):
                         "train loss": avg_loss,
                         "train steps/sec": steps_per_sec
                     }
+                    # Add learning rates with descriptive labels
+                    if args.use_muon and len(current_lrs) > 1:
+                        log_dict["lr_muon"] = current_lrs[0]  # Hidden weights (2D+ params)
+                        log_dict["lr_adamw"] = current_lrs[1]  # Gains/biases + non-hidden params
+                    else:
+                        log_dict["learning rate"] = current_lrs[0]
                     # Add samples and FID if they were generated at this step
                     if 'first_batch_samples' in locals():
                         sample_grid = wandb_utils.array2grid(first_batch_samples)
