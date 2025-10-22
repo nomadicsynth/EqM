@@ -26,6 +26,7 @@ class VideoDataset(Dataset):
         self.root = root
         self.num_frames = num_frames
         self.transform = transform
+        self.extensions = extensions
         csv_path = os.path.join(root, f"{split}.csv")
         self.label_dict = {}
         with open(csv_path, 'r') as f:
