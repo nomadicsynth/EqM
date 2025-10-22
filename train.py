@@ -75,7 +75,7 @@ def compute_fid_from_inception_stats(mu1, sigma1, mu2, sigma2, eps=1e-6):
     diff = mu1 - mu2
     
     # Product might be almost singular
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    covmean = linalg.sqrtm(sigma1.dot(sigma2))
     if not np.isfinite(covmean).all():
         offset = np.eye(sigma1.shape[0]) * eps
         covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
@@ -219,6 +219,8 @@ def main(args):
         torch.backends.cuda.enable_cudnn_sdp(False)
         torch.backends.cuda.enable_math_sdp(True)
     # Setup DDP:
+    import warnings
+    warnings.filterwarnings('ignore', message='.*barrier.*using the device under current context.*')
     dist.init_process_group("nccl")
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
@@ -566,27 +568,8 @@ def main(args):
             running_loss += loss.item()
             log_steps += 1
             train_steps += 1
-            if train_steps % args.log_every == 0:
-                # Measure training speed:
-                torch.cuda.synchronize()
-                end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                if args.wandb:
-                    wandb_utils.log(
-                        { "train loss": avg_loss, "train steps/sec": steps_per_sec },
-                        step=train_steps
-                    )
-                # Reset monitoring variables:
-                running_loss = 0
-                log_steps = 0
-                start_time = time()
-
-            # Generate samples:
+            
+            # Generate samples (check before logging to ensure correct step order):
             if args.sample_every > 0 and train_steps % args.sample_every == 0 and train_steps > 0:
                 if rank == 0:
                     logger.info(f"Generating samples at step {train_steps}...")
@@ -708,11 +691,12 @@ def main(args):
                             
                             generated_frames_list.append(samples_to_log)
                             
-                            # Log first batch to wandb for visualization
-                            if fid_batch_idx == 0 and args.wandb:
-                                wandb_utils.log_image(samples_to_log, step=train_steps)
+                            # Store first batch for logging
+                            if fid_batch_idx == 0:
+                                first_batch_samples = samples_to_log
                         
                         # Compute FID if enabled
+                        fid_score = None
                         if args.compute_fid and real_features_collected:
                             logger.info("Computing FID...")
                             generated_frames = torch.cat(generated_frames_list, dim=0)[:args.fid_num_samples]
@@ -725,12 +709,44 @@ def main(args):
                             # Compute FID
                             fid_score = compute_fid_from_inception_stats(real_mu, real_sigma, gen_mu, gen_sigma)
                             logger.info(f"FID Score: {fid_score:.2f}")
-                            
-                            if args.wandb:
-                                wandb_utils.log({"fid": fid_score}, step=train_steps)
                         
-                        logger.info(f"Samples generated and logged to wandb")
+                        logger.info(f"Samples generated")
                 dist.barrier()
+            
+            # Log training metrics (and samples if generated at this step):
+            if train_steps % args.log_every == 0:
+                # Measure training speed:
+                torch.cuda.synchronize()
+                end_time = time()
+                steps_per_sec = log_steps / (end_time - start_time)
+                # Reduce loss history over all processes:
+                avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                avg_loss = avg_loss.item() / dist.get_world_size()
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                
+                # Collect all wandb metrics to log at once
+                if args.wandb:
+                    import wandb
+                    log_dict = {
+                        "train loss": avg_loss,
+                        "train steps/sec": steps_per_sec
+                    }
+                    # Add samples and FID if they were generated at this step
+                    if 'first_batch_samples' in locals():
+                        sample_grid = wandb_utils.array2grid(first_batch_samples)
+                        log_dict["samples"] = wandb.Image(sample_grid)
+                        del first_batch_samples  # Clear for next time
+                    if 'fid_score' in locals() and fid_score is not None:
+                        log_dict["fid"] = fid_score
+                        fid_score = None  # Clear for next time
+                    
+                    wandb_utils.log(log_dict, step=train_steps)
+                
+                # Reset monitoring variables:
+                running_loss = 0
+                log_steps = 0
+                start_time = time()
 
             # Save EqM checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
