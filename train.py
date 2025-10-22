@@ -470,7 +470,8 @@ def main(args):
         sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        persistent_workers=True if args.num_workers > 0 else False
     )
     if isinstance(dataset, VideoDataset):
         logger.info(f"Dataset contains {len(dataset):,} videos ({args.data_path})")
