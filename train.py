@@ -428,7 +428,7 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None,
-                        help="Optional path to a custom EqM checkpoint")
+                        help="Path to an EqM checkpoint to continue training from")
     parser.add_argument("--disp", action="store_true",
                         help="Toggle to enable Dispersive Loss")
     parser.add_argument("--uncond", type=bool, default=True,
