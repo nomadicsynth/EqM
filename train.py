@@ -365,7 +365,7 @@ def main(args):
     if args.lr_schedule == 'cosine':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_train_steps)
     elif args.lr_schedule == 'linear':
-        scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=max_train_steps)
+        scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=max_train_steps)
     else:
         scheduler = None
 
