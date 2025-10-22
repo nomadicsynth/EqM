@@ -597,15 +597,18 @@ def main(args):
                             else:
                                 frames, _ = batch_data
                             
-                            frames = frames.to(device)
+                            # Move to CPU to avoid VRAM accumulation
                             real_frames_list.append(frames)
                             frame_count += frames.shape[0]
                         
-                        real_frames = torch.cat(real_frames_list, dim=0)[:target_samples]
+                        real_frames = torch.cat(real_frames_list, dim=0)[:target_samples].to(device)
                         real_features = get_inception_features(real_frames, inception_model, batch_size=32)
                         real_features_accumulated = real_features
                         real_features_collected = True
                         logger.info(f"Collected {real_features.shape[0]} real frame features")
+                        # Free up VRAM
+                        del real_frames, real_frames_list
+                        torch.cuda.empty_cache()
                     
                     with torch.no_grad():
                         # Compute time_scale for video (temporal spacing between frames)
