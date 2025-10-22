@@ -363,9 +363,16 @@ def main(args):
     # Setup learning rate scheduler
     max_train_steps = args.max_steps if args.max_steps is not None else args.epochs * len(loader)
     if args.lr_schedule == 'cosine':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_train_steps)
+        import math
+        def cosine_schedule(step):
+            """Cosine schedule that decays to min_lr_factor of initial LR"""
+            progress = step / max_train_steps
+            min_factor = args.min_lr_factor
+            return min_factor + (1 - min_factor) * (1 + math.cos(math.pi * progress)) / 2
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=cosine_schedule)
     elif args.lr_schedule == 'linear':
-        scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.1, total_iters=max_train_steps)
+        scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=args.min_lr_factor, total_iters=max_train_steps)
     else:
         scheduler = None
 
@@ -519,6 +526,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--lr-schedule", type=str, choices=["constant", "linear", "cosine"], default="constant", help="Learning rate schedule")
+    parser.add_argument("--min-lr-factor", type=float, default=0.1, help="Minimum learning rate as a factor of initial LR (for cosine/linear schedules)")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for AdamW optimizer")
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
