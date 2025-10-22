@@ -24,6 +24,7 @@ from time import time
 import argparse
 import logging
 import os
+import signal
 from tqdm import tqdm
 from models import EqM_models
 from download import find_model
@@ -503,6 +504,17 @@ def main(args):
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
     
+    # Setup signal handler for graceful shutdown on Ctrl+C
+    interrupted = False
+    def signal_handler(signum, frame):
+        nonlocal interrupted
+        if rank == 0:
+            logger.info("\nReceived interrupt signal (Ctrl+C). Saving checkpoint and exiting...")
+        interrupted = True
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     # For FID: accumulate real frame features
     real_features_accumulated = []
     real_features_collected = False  # Flag to collect real features only once
@@ -543,12 +555,12 @@ def main(args):
     opt.zero_grad()
     
     for epoch in tqdm(range(args.epochs), desc="Training", disable=rank != 0, unit="epoch", dynamic_ncols=True):
-        if train_steps >= max_train_steps:
+        if train_steps >= max_train_steps or interrupted:
             break
         sampler.set_epoch(epoch)
         # logger.info(f"Beginning epoch {epoch}...")
         for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True):
-            if train_steps >= max_train_steps:
+            if train_steps >= max_train_steps or interrupted:
                 break
             if getattr(args, 'video', False):
                 x, y, time_spans = batch
@@ -823,10 +835,30 @@ def main(args):
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
 
+    # Save final checkpoint
+    if rank == 0:
+        checkpoint = {
+            "model": model.module.state_dict(),
+            "ema": ema.state_dict(),
+            "opt": opt.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler else None,
+            "args": args
+        }
+        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+        torch.save(checkpoint, checkpoint_path)
+        if interrupted:
+            logger.info(f"Saved checkpoint after interruption to {checkpoint_path}")
+        else:
+            logger.info(f"Saved final checkpoint to {checkpoint_path}")
+    dist.barrier()
+
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
-    logger.info("Done!")
+    if interrupted:
+        logger.info("Training interrupted by user.")
+    else:
+        logger.info("Done!")
     cleanup()
 
 
