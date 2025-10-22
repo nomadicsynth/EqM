@@ -40,6 +40,7 @@ from pathlib import Path
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 import torch.optim.lr_scheduler
+from scipy import linalg
 
 try:
     from muon import MuonWithAuxAdam
@@ -50,6 +51,89 @@ except ImportError:
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
+
+@torch.no_grad()
+def compute_fid_from_inception_stats(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """
+    Compute Frechet Inception Distance (FID) between two Gaussian distributions.
+    
+    Args:
+        mu1: Mean of first distribution
+        sigma1: Covariance of first distribution
+        mu2: Mean of second distribution
+        sigma2: Covariance of second distribution
+        eps: Small value for numerical stability
+    
+    Returns:
+        FID score (float)
+    """
+    mu1 = np.atleast_1d(mu1)
+    mu2 = np.atleast_1d(mu2)
+    sigma1 = np.atleast_2d(sigma1)
+    sigma2 = np.atleast_2d(sigma2)
+    
+    diff = mu1 - mu2
+    
+    # Product might be almost singular
+    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    
+    # Numerical error might give slight imaginary component
+    if np.iscomplexobj(covmean):
+        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            m = np.max(np.abs(covmean.imag))
+            raise ValueError(f"Imaginary component {m}")
+        covmean = covmean.real
+    
+    tr_covmean = np.trace(covmean)
+    
+    return diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
+
+
+@torch.no_grad()
+def get_inception_features(images, inception_model, batch_size=32):
+    """
+    Extract InceptionV3 features from images.
+    
+    Args:
+        images: Tensor of images (N, C, H, W) in range [-1, 1]
+        inception_model: InceptionV3 model
+        batch_size: Batch size for processing
+    
+    Returns:
+        features: (N, 2048) array of features
+    """
+    inception_model.eval()
+    features = []
+    
+    for i in range(0, images.shape[0], batch_size):
+        batch = images[i:i+batch_size]
+        # Resize to 299x299 for InceptionV3
+        if batch.shape[-1] != 299:
+            batch = F.interpolate(batch, size=(299, 299), mode='bilinear', align_corners=False)
+        # Normalize from [-1, 1] to [0, 1] then to ImageNet stats
+        batch = (batch + 1) / 2  # [-1, 1] -> [0, 1]
+        # Apply ImageNet normalization
+        mean = torch.tensor([0.485, 0.456, 0.406], device=batch.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=batch.device).view(1, 3, 1, 1)
+        batch = (batch - mean) / std
+        
+        with torch.no_grad():
+            feat = inception_model(batch)
+        features.append(feat.cpu().numpy())
+    
+    return np.concatenate(features, axis=0)
+
+
+@torch.no_grad()
+def compute_stats(features):
+    """Compute mean and covariance of features."""
+    mu = np.mean(features, axis=0)
+    sigma = np.cov(features, rowvar=False)
+    return mu, sigma
+
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -319,6 +403,17 @@ def main(args):
     transport_sampler = Sampler(transport)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"EqM Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Load InceptionV3 for FID computation if enabled
+    inception_model = None
+    if args.compute_fid and rank == 0:
+        logger.info("Loading InceptionV3 for FID computation...")
+        from torchvision.models import Inception_V3_Weights
+        inception_model = models.inception_v3(weights=Inception_V3_Weights.DEFAULT, transform_input=False)
+        inception_model.fc = torch.nn.Identity()  # Remove final classification layer
+        inception_model = inception_model.to(device)
+        inception_model.eval()
+        requires_grad(inception_model, False)
 
     # Log mixed precision configuration
     if args.use_bf16:
@@ -384,6 +479,10 @@ def main(args):
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
+    
+    # For FID: accumulate real frame features
+    real_features_accumulated = []
+    real_features_collected = False  # Flag to collect real features only once
 
     # Variables for monitoring/logging purposes:
     train_steps = 0
@@ -487,6 +586,152 @@ def main(args):
                 log_steps = 0
                 start_time = time()
 
+            # Generate samples:
+            if args.sample_every > 0 and train_steps % args.sample_every == 0 and train_steps > 0:
+                if rank == 0:
+                    logger.info(f"Generating samples at step {train_steps}...")
+                    ema.eval()
+                    
+                    # Collect real features for FID (only once)
+                    if args.compute_fid and not real_features_collected:
+                        logger.info("Collecting real frame features for FID...")
+                        real_frames_list = []
+                        frame_count = 0
+                        target_samples = min(args.fid_num_samples, len(dataset))
+                        
+                        # Collect frames from real data
+                        for batch_data in loader:
+                            if frame_count >= target_samples:
+                                break
+                            
+                            if getattr(args, 'video', False):
+                                x_real, _, _ = batch_data
+                                # x_real: (N, C, T, H, W)
+                                N, C, T, H, W = x_real.shape
+                                # Take middle frame from each video
+                                mid_frame_idx = T // 2
+                                frames = x_real[:, :, mid_frame_idx, :, :]  # (N, C, H, W)
+                            else:
+                                frames, _ = batch_data
+                            
+                            frames = frames.to(device)
+                            real_frames_list.append(frames)
+                            frame_count += frames.shape[0]
+                        
+                        real_frames = torch.cat(real_frames_list, dim=0)[:target_samples]
+                        real_features = get_inception_features(real_frames, inception_model, batch_size=32)
+                        real_features_accumulated = real_features
+                        real_features_collected = True
+                        logger.info(f"Collected {real_features.shape[0]} real frame features")
+                    
+                    with torch.no_grad():
+                        # Compute time_scale for video (temporal spacing between frames)
+                        if getattr(args, 'video', False):
+                            # Calculate time_scale from video duration
+                            # e.g., 2.0s duration with 4 frames = 2.0/3 = 0.667 s/frame
+                            time_scale_sample = args.sample_video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
+                            logger.info(f"Sampling with time_scale={time_scale_sample:.4f} s/frame ({args.sample_video_duration}s over {args.num_frames} frames)")
+                        else:
+                            time_scale_sample = 1.0
+                        
+                        # Generate multiple batches for FID if needed
+                        generated_frames_list = []
+                        num_fid_batches = (args.fid_num_samples + local_batch_size - 1) // local_batch_size if args.compute_fid else 1
+                        
+                        for fid_batch_idx in range(num_fid_batches):
+                            # Initialize for gradient descent sampling
+                            if getattr(args, 'video', False):
+                                zs_batch = torch.randn(local_batch_size, 4, args.num_frames, latent_size, latent_size, device=device)
+                            else:
+                                zs_batch = torch.randn(local_batch_size, 4, latent_size, latent_size, device=device)
+                            
+                            ys_batch = torch.randint(args.num_classes, size=(local_batch_size,), device=device)
+                            
+                            if use_cfg:
+                                zs_batch = torch.cat([zs_batch, zs_batch], 0)
+                                y_null_batch = torch.tensor([args.num_classes] * local_batch_size, device=device)
+                                ys_batch = torch.cat([ys_batch, y_null_batch], 0)
+                            
+                            xt = zs_batch.clone()
+                            t = torch.ones((xt.shape[0],)).to(xt).to(device)
+                            m = torch.zeros_like(xt).to(xt).to(device)
+                            
+                            if use_cfg:
+                                sample_kwargs = dict(y=ys_batch, cfg_scale=args.cfg_scale, time_scale=time_scale_sample)
+                            else:
+                                sample_kwargs = dict(y=ys_batch, time_scale=time_scale_sample)
+                            
+                            # Use autocast for sampling
+                            with autocast(device_type='cuda', dtype=autocast_dtype, enabled=args.use_amp or args.use_bf16):
+                                # Gradient descent sampling loop
+                                if args.sample_method == 'ngd':
+                                    # Nesterov Accelerated Gradient Descent
+                                    for _ in range(args.num_sample_steps - 1):
+                                        x_ = xt + args.sample_stepsize * m * args.sample_mu
+                                        out = model_fn(x_, t, **sample_kwargs)
+                                        if not torch.is_tensor(out):
+                                            out = out[0]
+                                        m = out
+                                        xt = xt + out * args.sample_stepsize
+                                        t += args.sample_stepsize
+                                elif args.sample_method == 'gd':
+                                    # Standard Gradient Descent
+                                    for _ in range(args.num_sample_steps - 1):
+                                        out = model_fn(xt, t, **sample_kwargs)
+                                        if not torch.is_tensor(out):
+                                            out = out[0]
+                                        xt = xt + out * args.sample_stepsize
+                                        t += args.sample_stepsize
+                                else:  # 'ode'
+                                    # Use ODE sampler (original method)
+                                    sample_fn = transport_sampler.sample_ode(
+                                        sampling_method="dopri5",
+                                        num_steps=args.num_sample_steps,
+                                    )
+                                    xt = sample_fn(zs_batch, model_fn, **sample_kwargs)[-1]
+                            
+                            samples = xt
+                            if use_cfg:
+                                samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+                            
+                            # Decode samples from latent space
+                            if getattr(args, 'video', False):
+                                # For video: decode frames
+                                N, C, T, H, W = samples.shape
+                                samples_frames = samples.permute(0, 2, 1, 3, 4).reshape(N * T, C, H, W)
+                                decoded_frames = vae.decode(samples_frames / 0.18215).sample
+                                # Take middle frame from each video for visualization
+                                mid_frame_idx = T // 2
+                                samples_to_log = decoded_frames.reshape(N, T, 3, decoded_frames.shape[-2], decoded_frames.shape[-1])[:, mid_frame_idx]
+                            else:
+                                samples_to_log = vae.decode(samples / 0.18215).sample
+                            
+                            generated_frames_list.append(samples_to_log)
+                            
+                            # Log first batch to wandb for visualization
+                            if fid_batch_idx == 0 and args.wandb:
+                                wandb_utils.log_image(samples_to_log, step=train_steps)
+                        
+                        # Compute FID if enabled
+                        if args.compute_fid and real_features_collected:
+                            logger.info("Computing FID...")
+                            generated_frames = torch.cat(generated_frames_list, dim=0)[:args.fid_num_samples]
+                            generated_features = get_inception_features(generated_frames, inception_model, batch_size=32)
+                            
+                            # Compute statistics
+                            real_mu, real_sigma = compute_stats(real_features_accumulated)
+                            gen_mu, gen_sigma = compute_stats(generated_features)
+                            
+                            # Compute FID
+                            fid_score = compute_fid_from_inception_stats(real_mu, real_sigma, gen_mu, gen_sigma)
+                            logger.info(f"FID Score: {fid_score:.2f}")
+                            
+                            if args.wandb:
+                                wandb_utils.log({"fid": fid_score}, step=train_steps)
+                        
+                        logger.info(f"Samples generated and logged to wandb")
+                dist.barrier()
+
             # Save EqM checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
@@ -524,6 +769,14 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50000)
+    parser.add_argument("--sample-every", type=int, default=5000, help="Generate samples every N steps (0 to disable)")
+    parser.add_argument("--num-sample-steps", type=int, default=250, help="Number of sampling steps for visualization")
+    parser.add_argument("--sample-stepsize", type=float, default=0.003, help="Step size for gradient descent sampling")
+    parser.add_argument("--sample-mu", type=float, default=0.35, help="Momentum parameter for NGD sampling")
+    parser.add_argument("--sample-method", type=str, default="ngd", choices=["gd", "ngd", "ode"], help="Sampling method for visualization")
+    parser.add_argument("--sample-video-duration", type=float, default=2.0, help="Video duration for sampling (used to compute time_scale)")
+    parser.add_argument("--compute-fid", action="store_true", help="Compute frame-wise FID during sampling")
+    parser.add_argument("--fid-num-samples", type=int, default=50, help="Number of videos/images to generate for FID computation")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--lr-schedule", type=str, choices=["constant", "linear", "cosine"], default="constant", help="Learning rate schedule")
     parser.add_argument("--min-lr-factor", type=float, default=0.1, help="Minimum learning rate as a factor of initial LR (for cosine/linear schedules)")
