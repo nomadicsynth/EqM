@@ -39,6 +39,7 @@ from torchvision.transforms.functional import to_pil_image
 from pathlib import Path
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
+import torch.optim.lr_scheduler
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -178,7 +179,7 @@ def main(args):
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
 
     # Setup mixed precision training
     scaler = GradScaler('cuda', enabled=args.use_amp)
@@ -211,6 +212,7 @@ def main(args):
             model.load_state_dict(model_state, strict=False)
             ema.load_state_dict(ema_state, strict=False)
             opt.load_state_dict(state_dict["opt"])
+            scheduler_state = state_dict.get("scheduler")
         else:
             model_state = state_dict
             ema_state = state_dict
@@ -228,6 +230,7 @@ def main(args):
                     
             model.load_state_dict(model_state, strict=False)
             ema.load_state_dict(ema_state, strict=False)
+            scheduler_state = state_dict.get("scheduler")
 
         ema = ema.to(device)
         model = model.to(device)
@@ -283,6 +286,19 @@ def main(args):
         logger.info(f"Dataset contains {len(dataset):,} videos ({args.data_path})")
     else:
         logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+
+    # Setup learning rate scheduler
+    max_train_steps = args.max_steps if args.max_steps is not None else args.epochs * len(loader)
+    if args.lr_schedule == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_train_steps)
+    elif args.lr_schedule == 'linear':
+        scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=0.0, total_iters=max_train_steps)
+    else:
+        scheduler = None
+
+    # Load scheduler state if resuming from checkpoint
+    if args.ckpt is not None and scheduler is not None and 'scheduler_state' in locals() and scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
@@ -364,6 +380,8 @@ def main(args):
             scaler.step(opt)
             scaler.update()
             update_ema(ema, model.module)
+            if scheduler:
+                scheduler.step()
 
             # Log loss values:
             running_loss += loss.item()
@@ -396,6 +414,7 @@ def main(args):
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
+                        "scheduler": scheduler.state_dict() if scheduler else None,
                         "args": args
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
@@ -425,6 +444,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50000)
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lr-schedule", type=str, choices=["constant", "linear", "cosine"], default="constant", help="Learning rate schedule")
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None,
