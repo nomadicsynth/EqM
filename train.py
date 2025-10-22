@@ -41,6 +41,12 @@ import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 import torch.optim.lr_scheduler
 
+try:
+    from muon import MuonWithAuxAdam
+    MUON_AVAILABLE = True
+except ImportError:
+    MUON_AVAILABLE = False
+
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
@@ -178,8 +184,75 @@ def main(args):
     # Note that parameter initialization is done within the EqM constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
 
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
+    # Setup optimizer
+    if args.use_muon:
+        if not MUON_AVAILABLE:
+            raise ImportError("Muon optimizer not available. Install it with: pip install muon")
+        
+        logger.info("Using Muon optimizer for hidden weights")
+        
+        # Categorize parameters for Muon
+        # Hidden weights: 2D+ parameters in transformer blocks
+        # Hidden gains/biases: 1D parameters in transformer blocks
+        # Non-hidden: embeddings, timestep embedder, label embedder, patch embedder (optionally)
+        
+        hidden_weights = []
+        hidden_gains_biases = []
+        nonhidden_params = []
+        
+        # Transformer blocks contain the main hidden weights
+        for block in model.blocks:
+            for name, param in block.named_parameters():
+                if param.ndim >= 2:
+                    hidden_weights.append(param)
+                else:
+                    hidden_gains_biases.append(param)
+        
+        # Final layer
+        for name, param in model.final_layer.named_parameters():
+            if param.ndim >= 2:
+                hidden_weights.append(param)
+            else:
+                hidden_gains_biases.append(param)
+        
+        # Embedders and patch projection
+        nonhidden_params.extend(model.t_embedder.parameters())
+        nonhidden_params.extend(model.y_embedder.parameters())
+        
+        # Patch embedder: controlled by --muon-patch-embed flag
+        if args.muon_patch_embed:
+            for param in model.x_embedder.parameters():
+                if param.ndim >= 2:
+                    hidden_weights.append(param)
+                else:
+                    nonhidden_params.append(param)
+        else:
+            nonhidden_params.extend(model.x_embedder.parameters())
+        
+        # Positional embeddings (if not using RoPE)
+        if hasattr(model, 'pos_embed'):
+            nonhidden_params.append(model.pos_embed)
+        
+        # RoPE parameters (if using RoPE)
+        if args.use_rope:
+            for block in model.blocks:
+                if hasattr(block, 'rope'):
+                    nonhidden_params.extend(block.rope.parameters())
+        
+        logger.info(f"Muon: {len(hidden_weights)} hidden weight tensors (2D+)")
+        logger.info(f"AdamW: {len(hidden_gains_biases)} hidden gain/bias tensors (1D)")
+        logger.info(f"AdamW: {len(nonhidden_params)} non-hidden parameter tensors")
+        
+        param_groups = [
+            dict(params=hidden_weights, use_muon=True,
+                 lr=args.muon_lr, weight_decay=args.weight_decay),
+            dict(params=hidden_gains_biases + nonhidden_params, use_muon=False,
+                 lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay),
+        ]
+        opt = MuonWithAuxAdam(param_groups)
+    else:
+        # Standard AdamW optimizer
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # Setup mixed precision training
     scaler = GradScaler('cuda', enabled=args.use_amp)
@@ -446,6 +519,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--lr-schedule", type=str, choices=["constant", "linear", "cosine"], default="constant", help="Learning rate schedule")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for AdamW optimizer")
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None,
@@ -462,6 +536,9 @@ if __name__ == "__main__":
     parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision training (FP16)")
     parser.add_argument("--use-bf16", action="store_true", help="Enable bfloat16 mixed precision training (BF16)")
     parser.add_argument("--use-rope", action="store_true", help="Use Rotary Position Embedding (RoPE) instead of fixed sinusoidal embeddings. Allows training with varying number of frames.")
+    parser.add_argument("--use-muon", action="store_true", help="Use Muon optimizer for hidden weights (2D+ params in transformer blocks)")
+    parser.add_argument("--muon-lr", type=float, default=0.02, help="Learning rate for Muon optimizer")
+    parser.add_argument("--muon-patch-embed", action="store_true", help="Apply Muon to patch embedding projection layer (experimental)")
 
     parse_transport_args(parser)
     args = parser.parse_args()
