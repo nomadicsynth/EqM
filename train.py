@@ -403,6 +403,18 @@ def main(args):
         model = model.to(device)
     requires_grad(ema, False)
     model = DDP(model, device_ids=[device])
+    
+    # Apply torch.compile if requested (PyTorch 2.0+)
+    if args.use_compile:
+        # Skip compile - it's not working and i'll figure it out later
+        # TODO: Fix torch.compile usage
+        logger.warning("torch.compile() not working, skipping compilation")
+        # if hasattr(torch, 'compile'):
+        #     logger.info("Compiling model with torch.compile()...")
+        #     model = torch.compile(model)
+        # else:
+        #     logger.warning("torch.compile() not available (requires PyTorch 2.0+), skipping compilation")
+    
     transport = create_transport(
         args.path_type,
         args.prediction,
@@ -843,6 +855,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-muon", action="store_true", help="Use Muon optimizer for hidden weights (2D+ params in transformer blocks)")
     parser.add_argument("--muon-lr", type=float, default=0.02, help="Learning rate for Muon optimizer")
     parser.add_argument("--muon-patch-embed", action="store_true", help="Apply Muon to patch embedding projection layer (experimental)")
+    parser.add_argument("--use-compile", action="store_true", help="Use torch.compile() for faster training (requires PyTorch 2.0+)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Number of gradient accumulation steps (allows larger effective batch size with less VRAM)")
 
     parse_transport_args(parser)
