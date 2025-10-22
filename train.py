@@ -615,11 +615,11 @@ def main(args):
                     # Collect real features for FID (only once)
                     if args.compute_fid and not real_features_collected:
                         logger.info("Collecting real frame features for FID...")
-                        real_frames_list = []
+                        real_features_list = []
                         frame_count = 0
                         target_samples = min(args.fid_num_samples, len(dataset))
                         
-                        # Collect frames from real data
+                        # Process frames in chunks to reduce peak VRAM usage
                         for batch_data in loader:
                             if frame_count >= target_samples:
                                 break
@@ -634,17 +634,22 @@ def main(args):
                             else:
                                 frames, _ = batch_data
                             
-                            # Move to CPU to avoid VRAM accumulation
-                            real_frames_list.append(frames)
+                            # Process frames immediately and extract features
+                            # This avoids accumulating frames in memory
+                            frames = frames.to(device)
+                            batch_features = get_inception_features(frames, inception_model, batch_size=32)
+                            real_features_list.append(batch_features)
                             frame_count += frames.shape[0]
+                            
+                            # Free memory immediately
+                            del frames
+                            torch.cuda.empty_cache()
                         
-                        real_frames = torch.cat(real_frames_list, dim=0)[:target_samples].to(device)
-                        real_features = get_inception_features(real_frames, inception_model, batch_size=32)
-                        real_features_accumulated = real_features
+                        # Concatenate all features (much smaller than raw frames)
+                        real_features_accumulated = np.concatenate(real_features_list, axis=0)[:target_samples]
                         real_features_collected = True
-                        logger.info(f"Collected {real_features.shape[0]} real frame features")
-                        # Free up VRAM
-                        del real_frames, real_frames_list
+                        logger.info(f"Collected {real_features_accumulated.shape[0]} real frame features")
+                        del real_features_list
                         torch.cuda.empty_cache()
                     
                     with torch.no_grad():
@@ -729,18 +734,29 @@ def main(args):
                             else:
                                 samples_to_log = vae.decode(samples / 0.18215).sample
                             
-                            generated_frames_list.append(samples_to_log)
-                            
                             # Store first batch for logging
                             if fid_batch_idx == 0:
-                                first_batch_samples = samples_to_log
+                                first_batch_samples = samples_to_log.clone()
+                            
+                            # For FID: extract features immediately to save VRAM
+                            if args.compute_fid:
+                                batch_features = get_inception_features(samples_to_log, inception_model, batch_size=32)
+                                generated_frames_list.append(batch_features)
+                            else:
+                                generated_frames_list.append(samples_to_log)
+                            
+                            # Free memory
+                            del samples, samples_to_log
+                            if getattr(args, 'video', False):
+                                del samples_frames, decoded_frames
+                            torch.cuda.empty_cache()
                         
                         # Compute FID if enabled
                         fid_score = None
                         if args.compute_fid and real_features_collected:
                             logger.info("Computing FID...")
-                            generated_frames = torch.cat(generated_frames_list, dim=0)[:args.fid_num_samples]
-                            generated_features = get_inception_features(generated_frames, inception_model, batch_size=32)
+                            # Features were already extracted in the loop above
+                            generated_features = np.concatenate(generated_frames_list, axis=0)[:args.fid_num_samples]
                             
                             # Compute statistics
                             real_mu, real_sigma = compute_stats(real_features_accumulated)
@@ -749,6 +765,10 @@ def main(args):
                             # Compute FID
                             fid_score = compute_fid_from_inception_stats(real_mu, real_sigma, gen_mu, gen_sigma)
                             logger.info(f"FID Score: {fid_score:.2f}")
+                            
+                            # Clean up
+                            del generated_features
+                            torch.cuda.empty_cache()
                         
                         logger.info(f"Samples generated")
                 dist.barrier()
