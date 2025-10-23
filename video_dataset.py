@@ -76,6 +76,11 @@ class VideoDataset(Dataset):
         self.label_to_idx = {l: i for i, l in enumerate(uniq)}
         self.labels_idx = [self.label_to_idx[l] for l in self.labels]
 
+    def set_frame_range(self, min_frames: int, max_frames: int):
+        """Update the frame sampling range for curriculum learning."""
+        self.min_frames = max(1, min_frames)
+        self.num_frames = max_frames
+
     def __len__(self):
         return len(self.video_paths)
 

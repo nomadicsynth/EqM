@@ -543,7 +543,7 @@ def main(args):
                 break
             tmp_bs = max(1, tmp_bs // 2)
 
-        computed_steps_per_phase = max(1, max_train_steps // max(1, num_phases))
+        computed_epochs_per_phase = max(1, args.epochs // max(1, num_phases))
 
         sampler = CurriculumTemporalSampler(
             dataset,
@@ -554,9 +554,9 @@ def main(args):
             shuffle=True,
             drop_last=True,
             seed=args.global_seed,
-            steps_per_phase=computed_steps_per_phase,
+            epochs_per_phase=computed_epochs_per_phase,
         )
-        logger.info(f"Curriculum learning: {len(sampler.curriculum_schedule)} phases, {computed_steps_per_phase} steps/phase, {max_train_steps} total steps")
+        logger.info(f"Curriculum learning: {len(sampler.curriculum_schedule)} phases, {computed_epochs_per_phase} epochs/phase, {args.epochs} total epochs")
         try:
             sampler.describe(world_size=dist.get_world_size())
         except Exception:
@@ -676,9 +676,9 @@ def main(args):
         if train_steps >= max_train_steps or interrupted:
             break
         sampler.set_epoch(epoch)
-        # Update curriculum sampler with current step
+        # Update dataset frame sampling for current curriculum phase
         if args.use_curriculum and isinstance(dataset, VideoDataset):
-            sampler.set_step(train_steps)
+            sampler.update_dataset_for_phase()
         
         # logger.info(f"Beginning epoch {epoch}...")
         for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True):

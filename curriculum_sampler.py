@@ -20,10 +20,10 @@ class CurriculumTemporalSampler(Sampler):
     
     Training Phases (example for 4 GPUs, base batch_size=64/gpu):
     
-    Phase 1 (steps 0-10k):     1-4 frames,  batch_size=64/gpu  (256 total)
-    Phase 2 (steps 10k-20k):   3-8 frames,  batch_size=32/gpu  (128 total)
-    Phase 3 (steps 20k-40k):   5-16 frames, batch_size=16/gpu  (64 total)
-    Phase 4 (steps 40k+):      1-16 frames, batch_size=16/gpu  (64 total) [full range]
+    Phase 1 (epochs 0-10):     1-4 frames,  batch_size=64/gpu  (256 total)
+    Phase 2 (epochs 10-20):    3-8 frames,  batch_size=32/gpu  (128 total)
+    Phase 3 (epochs 20-40):    5-16 frames, batch_size=16/gpu  (64 total)
+    Phase 4 (epochs 40+):      1-16 frames, batch_size=16/gpu  (64 total) [full range]
     
     VRAM usage stays constant: batch_size × num_frames ≈ constant
     
@@ -34,7 +34,7 @@ class CurriculumTemporalSampler(Sampler):
         dataset: VideoDataset with variable-length support
         batch_size: Default/fallback batch size per GPU (typically from CLI --global-batch-size)
         max_frames: Maximum frames to sample
-        curriculum_schedule: List of (step, min_frames, max_frames, batch_size_per_gpu)
+        curriculum_schedule: List of (epoch, min_frames, max_frames, batch_size_per_gpu)
                             If None, uses automatic schedule based on batch_size
         world_size: Number of GPUs for distributed training
         rank: Current GPU rank
@@ -54,7 +54,7 @@ class CurriculumTemporalSampler(Sampler):
         shuffle: bool = True,
         drop_last: bool = True,
         seed: int = 0,
-        steps_per_phase: int = 10000,
+        epochs_per_phase: int = 1,
     ):
         self.dataset = dataset
         self.default_batch_size = batch_size
@@ -65,24 +65,23 @@ class CurriculumTemporalSampler(Sampler):
         self.drop_last = drop_last
         self.seed = seed
         self.epoch = 0
-        self.step = 0  # Global training step (updated externally)
         
         # Automatic curriculum: Start at num_frames, then double frames while halving batch
         if curriculum_schedule is None:
             curriculum_schedule = []
-            current_step = 0
+            current_epoch = 0
             current_max_frames = max_frames  # Start at the specified max_frames
             current_batch = batch_size
             
             while current_batch >= 1:
-                curriculum_schedule.append((current_step, 1, current_max_frames, current_batch))
+                curriculum_schedule.append((current_epoch, 1, current_max_frames, current_batch))
                 
                 # Stop if batch size would go below 1
                 if current_batch == 1:
                     break
                     
                 # Move to next phase: double frames, halve batch
-                current_step += steps_per_phase
+                current_epoch += epochs_per_phase
                 current_max_frames *= 2  # Double the frame count
                 current_batch = max(1, current_batch // 2)
             
@@ -97,7 +96,7 @@ class CurriculumTemporalSampler(Sampler):
         """Pre-create bucket structures for each curriculum phase."""
         phase_buckets = []
         
-        for step_start, min_frames, max_frames, batch_size_per_gpu in self.curriculum_schedule:
+        for epoch_start, min_frames, max_frames, batch_size_per_gpu in self.curriculum_schedule:
             # Create fine-grained buckets within this phase's range
             # More buckets = less padding
             bucket_size = max(1, (max_frames - min_frames) // 4)  # ~4 buckets per phase
@@ -110,7 +109,7 @@ class CurriculumTemporalSampler(Sampler):
                 current = bucket_max + 1
             
             phase_buckets.append({
-                'step_start': step_start,
+                'epoch_start': epoch_start,
                 'min_frames': min_frames,
                 'max_frames': max_frames,
                 'batch_size': batch_size_per_gpu,
@@ -123,7 +122,7 @@ class CurriculumTemporalSampler(Sampler):
     def describe(self, world_size: int = 1, rank: int = 0):
         """Print a human-readable description of the curriculum schedule.
 
-        Call this after the sampler is final (e.g. after steps_per_phase is computed).
+        Call this after the sampler is final (e.g. after epochs_per_phase is computed).
         """
         # Only print from rank 0 in distributed runs to avoid duplicate logs
         if rank != 0:
@@ -140,17 +139,17 @@ class CurriculumTemporalSampler(Sampler):
         base_max_frames = base_phase[2]
         base_batch = base_phase[3]
 
-        for step, min_f, max_f, bs in self.curriculum_schedule:
+        for epoch, min_f, max_f, bs in self.curriculum_schedule:
             global_batch = bs * world_size
-            print(f"Step {step:6d}+: frames=[{min_f:2d}, {max_f:2d}], "
+            print(f"Epoch {epoch:6d}+: frames=[{min_f:2d}, {max_f:2d}], "
                   f"batch_size={bs}/gpu ({global_batch} global)")
         print("=" * 80)
     
     def _get_current_phase(self):
-        """Get current curriculum phase based on training step."""
+        """Get current curriculum phase based on training epoch."""
         current_phase = self.phase_buckets[0]
         for phase in self.phase_buckets:
-            if self.step >= phase['step_start']:
+            if self.epoch >= phase['epoch_start']:
                 current_phase = phase
             else:
                 break
@@ -171,23 +170,13 @@ class CurriculumTemporalSampler(Sampler):
         if getattr(self, 'rank', 0) == 0:
             print(f"\nAssigning samples to phase [{min_frames}-{max_frames} frames]...")
         
-        # Note: This assumes dataset can report frame counts without loading
-        # You may need to adapt based on your dataset structure
+        # For curriculum learning, all videos are eligible since we control sampling range
+        # Bucket based on the number of frames we'll sample (random within phase range)
         for idx in range(len(self.dataset)):
-            # Get actual frame count for this video
-            # This is a simplification - you may want to cache this
-            video, _, _ = self.dataset[idx]
-            num_frames = video.shape[1]  # (C, T, H, W)
-            
-            # Skip if outside phase range
-            if num_frames < min_frames or num_frames > max_frames:
-                continue
-            
-            # Find appropriate bucket
-            for bucket_idx, (bucket_min, bucket_max) in enumerate(buckets):
-                if bucket_min <= num_frames <= bucket_max:
-                    bucket_indices[bucket_idx].append(idx)
-                    break
+            # Assign to buckets based on sampled frame count within phase range
+            # Since sampling is random, distribute evenly across buckets
+            bucket_idx = idx % len(buckets)
+            bucket_indices[bucket_idx].append(idx)
         
         # Print statistics
         total = sum(len(indices) for indices in bucket_indices.values())
@@ -199,13 +188,22 @@ class CurriculumTemporalSampler(Sampler):
         phase['bucket_indices'] = bucket_indices
         return bucket_indices
     
-    def set_step(self, step: int):
-        """Update current training step for curriculum progression."""
-        self.step = step
+    def set_epoch(self, epoch: int):
+        """Update current training epoch for curriculum progression."""
+        self.epoch = epoch
     
     def set_epoch(self, epoch: int):
         """Set epoch for reproducible shuffling."""
         self.epoch = epoch
+    
+    def update_dataset_for_phase(self):
+        """Update the dataset's frame sampling parameters for the current phase."""
+        if not hasattr(self.dataset, 'set_frame_range'):
+            return  # Dataset doesn't support dynamic frame ranges
+        
+        phase = self._get_current_phase()
+        # Update dataset to sample within this phase's frame range
+        self.dataset.set_frame_range(phase['min_frames'], phase['max_frames'])
     
     def get_current_batch_size(self):
         """Get batch size for current curriculum phase."""
