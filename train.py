@@ -863,7 +863,7 @@ def main(args):
                         tokens_per_step = avg_tokens * float(current_bs)
                         max_raw = int(raw_frames.max())
                         padded_to = int(((max_raw + pt - 1) // pt) * pt)
-                        logger.info(f" batch={batch_idx}: raw_frames_min={int(raw_frames.min())}, raw_frames_max={max_raw}, padded_to={padded_to}, pt={pt}, patches_min={int(patch_counts.min())}, patches_max={int(patch_counts.max())}, avg_tokens/sample={avg_tokens:.1f}, tokens/step~{tokens_per_step:.1f}")
+                        logger.debug(f" batch={batch_idx}: raw_frames_min={int(raw_frames.min())}, raw_frames_max={max_raw}, padded_to={padded_to}, pt={pt}, patches_min={int(patch_counts.min())}, patches_max={int(patch_counts.max())}, avg_tokens/sample={avg_tokens:.1f}, tokens/step~{tokens_per_step:.1f}")
                         phase_logged_batches += 1
                 with torch.no_grad():
                     lat = vae.encode(x_frames).latent_dist.sample().mul_(0.18215)
