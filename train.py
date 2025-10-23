@@ -777,7 +777,12 @@ def main(args):
     
     # Initialize optimizer gradients for gradient accumulation
     opt.zero_grad()
-    
+
+    # Persist previous phase key across epochs so we only log on the first epoch
+    # (prev_phase_key is None -> first time) and when the phase actually changes.
+    prev_phase_key = None
+    phase_logged_batches = 0
+
     for epoch in tqdm(range(args.epochs), desc="Training", disable=rank != 0, unit="epoch", dynamic_ncols=True):
         if train_steps >= max_train_steps or interrupted:
             break
@@ -804,8 +809,6 @@ def main(args):
             except Exception:
                 epoch_total = int(per_gpu_batches_per_epoch)
 
-        prev_phase_key = None
-        phase_logged_batches = 0
         for batch_idx, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True, total=epoch_total)):
             if train_steps >= max_train_steps or interrupted:
                 break
@@ -1118,9 +1121,9 @@ def main(args):
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 current_lrs = [group['lr'] for group in opt.param_groups]
                 if args.use_muon and len(current_lrs) > 1:
-                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR_Muon: {current_lrs[0]:.6f}, LR_AdamW: {current_lrs[1]:.6f}")
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR_Muon: {current_lrs[0]:.6e}, LR_AdamW: {current_lrs[1]:.6e}")
                 else:
-                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lrs[0]:.6f}")
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lrs[0]:.6e}")
                 
                 # Collect all wandb metrics to log at once
                 if args.wandb:
