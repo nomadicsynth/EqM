@@ -43,7 +43,8 @@ class VideoDataset(Dataset):
         random_frames: bool = False,
         min_frames: int = 1,
         single_frame_prob: float = 0.0,
-        clip_sampler: Optional[TemporalClipSampler] = None
+        clip_sampler: Optional[TemporalClipSampler] = None,
+        clips_per_video: int = 1
     ):
         super().__init__()
         self.root = root
@@ -54,6 +55,7 @@ class VideoDataset(Dataset):
         self.min_frames = max(1, min_frames)  # Ensure at least 1 frame
         self.single_frame_prob = max(0.0, min(1.0, single_frame_prob))  # Clamp to [0, 1]
         self.clip_sampler = clip_sampler
+        self.clips_per_video = max(1, clips_per_video)  # Ensure at least 1
         csv_path = os.path.join(root, f"{split}.csv")
         self.label_dict = {}
         with open(csv_path, 'r') as f:
@@ -82,7 +84,7 @@ class VideoDataset(Dataset):
         self.num_frames = max_frames
 
     def __len__(self):
-        return len(self.video_paths)
+        return len(self.video_paths) * self.clips_per_video
 
     def _read_video_frames(self, path):
         frames, _, info = read_video(path, pts_unit='sec')
@@ -93,8 +95,11 @@ class VideoDataset(Dataset):
         return frames, fps  # numpy array and fps
 
     def __getitem__(self, idx):
-        path = self.video_paths[idx]
-        label = self.labels_idx[idx]
+        video_idx = idx // self.clips_per_video
+        clip_idx = idx % self.clips_per_video
+        
+        path = self.video_paths[video_idx]
+        label = self.labels_idx[video_idx]
         frames, fps = self._read_video_frames(path)  # (T, H, W, C) and fps
         n_frames = frames.shape[0]
         if n_frames == 0:
@@ -115,7 +120,7 @@ class VideoDataset(Dataset):
         # Determine if we're sampling a clip or full video
         if self.clip_sampler is not None and self.clip_sampler.should_sample_clip():
             clip_start, clip_end, clip_duration = self.clip_sampler.sample_clip_params(
-                video_duration, target_frames, fps
+                video_duration, target_frames, fps, seed=idx
             )
             # Convert to frame indices
             start_frame = int(clip_start * fps)

@@ -505,7 +505,8 @@ def main(args):
             random_frames=args.random_frames,
             min_frames=args.min_frames,
             single_frame_prob=args.single_frame_prob,
-            clip_sampler=clip_sampler
+            clip_sampler=clip_sampler,
+            clips_per_video=args.clips_per_video
         )
     else:
         dataset = ImageFolder(args.data_path, transform=transform)
@@ -522,7 +523,9 @@ def main(args):
     max_train_steps = args.max_steps if args.max_steps is not None else int(args.epochs * per_gpu_batches_per_epoch)
 
     if isinstance(dataset, VideoDataset):
-        logger.info(f"Dataset contains {dataset_size:,} videos ({args.data_path})")
+        logger.info(f"Dataset contains {len(dataset.video_paths):,} videos ({args.data_path})")
+        if args.clips_per_video > 1:
+            logger.info(f"Augmenting with {args.clips_per_video} clips per video: {dataset_size:,} total samples")
         if args.random_frames:
             logger.info(f"Random frame sampling enabled: {args.min_frames}-{args.num_frames} frames per clip")
         if args.single_frame_prob > 0:
@@ -667,7 +670,17 @@ def main(args):
         model_fn = ema.forward
 
     logger.info(f"Training for {args.epochs} epochs...")
-    max_train_steps = args.max_steps if args.max_steps is not None else args.epochs * len(loader)
+    # IMPORTANT: don't use len(loader) here because when using CurriculumTemporalSampler
+    # the loader length (batches per epoch) changes across curriculum phases as batch_size
+    # per-GPU is halved/doubled. To keep total training steps deterministic and avoid
+    # accidentally multiplying steps when the sampler changes batch sizes, use the
+    # precomputed per-GPU batches per epoch (from dataset_size and global batch size).
+    if args.max_steps is not None:
+        max_train_steps = args.max_steps
+    else:
+        # Use the earlier computed per-GPU batches per epoch so max_train_steps remains
+        # invariant to curriculum phase batch-size changes.
+        max_train_steps = args.epochs * per_gpu_batches_per_epoch
     
     # Initialize optimizer gradients for gradient accumulation
     opt.zero_grad()
@@ -681,7 +694,19 @@ def main(args):
             sampler.update_dataset_for_phase()
         
         # logger.info(f"Beginning epoch {epoch}...")
-        for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True):
+        # Use a stable per-epoch batch count for the progress bar when using curriculum.
+        # Curriculum phases can change the sampler's batch_size (per-GPU), which changes
+        # len(loader) for that epoch. To avoid the progress bar jumping (e.g., 110 -> 220),
+        # use the precomputed `per_gpu_batches_per_epoch` as the total when curriculum is enabled.
+        if getattr(args, 'use_curriculum', False) and hasattr(sampler, 'get_current_batch_size'):
+            epoch_total = int(per_gpu_batches_per_epoch)
+        else:
+            try:
+                epoch_total = len(loader)
+            except Exception:
+                epoch_total = None
+
+        for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True, total=epoch_total):
             if train_steps >= max_train_steps or interrupted:
                 break
             if getattr(args, 'video', False):
@@ -1061,15 +1086,16 @@ if __name__ == "__main__":
     parser.add_argument("--muon-patch-embed", action="store_true", help="Apply Muon to patch embedding projection layer (experimental)")
     parser.add_argument("--use-compile", action="store_true", help="Use torch.compile() for faster training (requires PyTorch 2.0+)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Number of gradient accumulation steps (allows larger effective batch size with less VRAM)")
-    
+
     # Curriculum learning arguments
     parser.add_argument("--use-curriculum", action="store_true", help="Enable curriculum learning: automatically double frame count and halve batch size each phase (steps per phase computed from total training length)")
-    
+
     # Clip sampling arguments
     parser.add_argument("--use-clip-sampling", action="store_true", help="Sample temporal clips from videos for finer motion detail")
     parser.add_argument("--clip-full-prob", type=float, default=0.3, help="Probability of using full video (default: 0.3)")
     parser.add_argument("--clip-center-prob", type=float, default=0.4, help="Probability of using center-biased clip (default: 0.4)")
     parser.add_argument("--center-bias-fraction", type=float, default=0.6, help="Fraction of video center to bias towards (default: 0.6)")
+    parser.add_argument("--clips-per-video", type=int, default=1, help="Number of clips to sample per video for data augmentation (default: 1)")
 
     parse_transport_args(parser)
     args = parser.parse_args()

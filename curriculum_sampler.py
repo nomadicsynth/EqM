@@ -309,13 +309,22 @@ class TemporalClipSampler:
         """Decide whether to sample clip or full video."""
         return np.random.random() < self.clip_prob
     
-    def sample_clip_params(self, video_duration: float, target_frames: int, fps: float):
+    def sample_clip_params(self, video_duration: float, target_frames: int, fps: float, seed: Optional[int] = None):
         """
         Determine clip start/end for sampling.
+        
+        Args:
+            video_duration: Duration of the video in seconds
+            target_frames: Number of frames to sample
+            fps: Frames per second of the video
+            seed: Optional random seed for reproducible sampling
         
         Returns:
             (clip_start_time, clip_end_time, clip_duration)
         """
+        if seed is not None:
+            np.random.seed(seed)
+        
         # Random clip duration as fraction of video length
         fraction = np.random.uniform(self.min_fraction, self.max_fraction)
         clip_duration = fraction * video_duration
@@ -326,46 +335,3 @@ class TemporalClipSampler:
         clip_end = clip_start + clip_duration
         
         return clip_start, clip_end, clip_duration
-
-
-# Usage example - integrate into VideoDataset.__getitem__:
-"""
-class VideoDataset(Dataset):
-    def __init__(self, ..., clip_sampler: Optional[TemporalClipSampler] = None):
-        self.clip_sampler = clip_sampler
-    
-    def __getitem__(self, idx):
-        frames, fps = self._read_video_frames(path)
-        n_frames = frames.shape[0]
-        video_duration = n_frames / fps
-        
-        # Determine if we're sampling a clip or full video
-        if self.clip_sampler and self.clip_sampler.should_sample_clip():
-            # Sample a temporal clip
-            clip_start, clip_end, clip_duration = self.clip_sampler.sample_clip_params(
-                video_duration, target_frames, fps
-            )
-            
-            # Convert to frame indices
-            start_frame = int(clip_start * fps)
-            end_frame = int(clip_end * fps)
-            clip_frames = frames[start_frame:end_frame]
-            
-            # Now sample target_frames uniformly from this clip
-            clip_n_frames = clip_frames.shape[0]
-            if clip_n_frames >= target_frames:
-                indices = np.linspace(0, clip_n_frames - 1, num=target_frames, dtype=int)
-                sampled_frames = clip_frames[indices]
-                time_span = clip_duration  # Actual time span of sampled frames
-            else:
-                # Clip too short, pad
-                sampled_frames = clip_frames
-                time_span = clip_duration
-        else:
-            # Sample from full video (existing logic)
-            indices = np.linspace(0, n_frames - 1, num=target_frames, dtype=int)
-            sampled_frames = frames[indices]
-            time_span = video_duration
-        
-        # Continue with transforms...
-"""
