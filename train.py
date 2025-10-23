@@ -502,11 +502,6 @@ def main(args):
     def video_collate_fn(batch):
         """Collate function for variable-length video sequences.
 
-        Requirements from curriculum: each sample may request a different
-        number of REAL frames (target_frames). We must NOT silently reduce
-        the number of real frames for any clip. Padding is allowed only to
-        make all clips in the batch the same length so they can be stacked.
-
         Returns:
             videos_batch: (N, C, T_max, H, W) tensor where T_max is the
                 maximum target-frames among samples in this batch.
@@ -984,28 +979,14 @@ def main(args):
                     with torch.no_grad():
                         # Compute time_scale for video (temporal spacing between frames)
                         if getattr(args, 'video', False):
-                            # Calculate time_scale from video duration (seconds per interval between patches).
-                            # Training computes time_scale as duration / (num_patches - 1) (intervals between patches),
-                            # so sampling must use the same convention to be consistent. Guard against the
-                            # single-patch case (no temporal intervals) and non-positive durations to avoid
-                            # division-by-zero and to match the training-time semantics where time_scale=0.
-                            patches_per_sample = (args.num_frames + pt - 1) // pt
-                            # Prefer intervals between patches (P-1). If only one patch but
-                            # multiple raw frames exist, fall back to raw-frame intervals
-                            # (num_frames-1) so sampling preserves a non-zero temporal spacing
-                            # across the original frames (useful when pt == num_frames).
-                            if patches_per_sample > 1 and args.sample_video_duration > 0:
-                                # seconds per patch-interval
-                                time_scale_scalar = args.sample_video_duration / (patches_per_sample - 1)
-                                logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/interval ({args.sample_video_duration}s over {args.num_frames} frames, pt={pt}, patches={patches_per_sample})")
-                            elif args.num_frames > 1 and args.sample_video_duration > 0:
-                                # single patch but multiple raw frames -> use per-frame intervals
-                                time_scale_scalar = args.sample_video_duration / (args.num_frames - 1)
-                                logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/frame-interval (fallback: {args.sample_video_duration}s over {args.num_frames} frames, pt={pt}, patches={patches_per_sample})")
+                            # Use seconds-per-frame (duration / num_frames) to match training's
+                            # time_scale definition. Guard against zero/negative duration or
+                            # zero frames.
+                            if args.sample_video_duration > 0 and args.num_frames > 0:
+                                time_scale_scalar = args.sample_video_duration / float(args.num_frames)
                             else:
-                                # Single frame or non-positive duration: no temporal intervals
                                 time_scale_scalar = 0.0
-                                logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/interval ({args.sample_video_duration}s over {args.num_frames} frames, pt={pt}, patches={patches_per_sample})")
+                            logger.info(f"Sampling with time_scale={time_scale_scalar:.6f} s/frame ({args.num_frames} frames over {args.sample_video_duration}s, pt={pt})")
                         else:
                             time_scale_scalar = 1.0
                         
