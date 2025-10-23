@@ -122,9 +122,10 @@ class RoPE3D(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_freq = max_freq
+        # TODO: Remove unused time_scale
         self.time_scale = time_scale
-        
-    def forward(self, x, grid_size, time_scale):
+
+    def forward(self, x, grid_size, time_scale, patch_temporal=1):
         """
         Apply 3D RoPE to input tensor.
         
@@ -149,8 +150,13 @@ class RoPE3D(nn.Module):
         x_t_list, x_h_list, x_w_list = [], [], []
         
         for b in range(batch_size):
-            # Generate position indices for this batch element
-            pos_t = torch.arange(t, device=x.device, dtype=torch.float32) * time_scale[b]
+            # Generate temporal positions as patch-center times in seconds.
+            # For token index i (0..t-1), the patch covers frames [i*pt .. i*pt+pt-1].
+            # The center frame index is i*pt + (pt-1)/2, so convert to seconds by
+            # multiplying by time_scale (seconds per frame).
+            pt = patch_temporal if isinstance(patch_temporal, int) else int(patch_temporal)
+            # Patch-end anchoring: token represents the last frame in the patch
+            pos_t = (torch.arange(t, device=x.device, dtype=torch.float32) * pt + (pt - 1)) * time_scale[b]
             pos_h = torch.arange(h, device=x.device, dtype=torch.float32)
             pos_w = torch.arange(w, device=x.device, dtype=torch.float32)
             
@@ -384,13 +390,22 @@ class SiTBlock(nn.Module):
         if use_rope:
             self.rope = RoPE3D(hidden_size)
 
-    def forward(self, x, c, grid_size=None, time_scale=None, attn_mask=None):
+    def forward(self, x, c, grid_size=None, time_scale=None, attn_mask=None, patch_size=1):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
         # Apply RoPE before attention if enabled
         x_normed = modulate(self.norm1(x), shift_msa, scale_msa)
         if self.use_rope and grid_size is not None:
-            x_normed = self.rope(x_normed, grid_size, time_scale)
+            # Determine temporal patch size (pt) from patch_size argument
+            if isinstance(patch_size, int):
+                pt = patch_size
+            else:
+                # patch_size may be tuple (pt, ph, pw)
+                try:
+                    pt = patch_size[0]
+                except Exception:
+                    pt = 1
+            x_normed = self.rope(x_normed, grid_size, time_scale, patch_temporal=pt)
         
         # Apply attention with optional masking
         if attn_mask is not None:
@@ -504,7 +519,7 @@ class EqM(nn.Module):
             self.hidden_size = hidden_size
             if not use_rope:
                 # Initialize with default time_scale=1.0 (frame indices)
-                pos_embed_default = get_3d_sincos_pos_embed(hidden_size, self.grid_size, time_scale=1.0)
+                pos_embed_default = get_3d_sincos_pos_embed(hidden_size, self.grid_size, time_scale=1.0, patch_temporal=pt)
                 self.register_buffer('pos_embed_default', torch.from_numpy(pos_embed_default).float().unsqueeze(0))
         else:
             if not use_rope:
@@ -613,8 +628,12 @@ class EqM(nn.Module):
             # Otherwise fall back to training grid_size
             if grid_size is None:
                 grid_size = self.grid_size
-            # Compute dynamic positional embedding with time scaling
-            pos_embed = get_3d_sincos_pos_embed(self.hidden_size, grid_size, time_scale=time_scale)
+            # Compute dynamic positional embedding with time scaling using patch-center times
+            if isinstance(self.patch_size, int):
+                pt = self.patch_size
+            else:
+                pt = self.patch_size[0]
+            pos_embed = get_3d_sincos_pos_embed(self.hidden_size, grid_size, time_scale=time_scale, patch_temporal=pt)
             return torch.from_numpy(pos_embed).float().unsqueeze(0).to(self.pos_embed_default.device)
         else:
             return self.pos_embed
@@ -809,14 +828,17 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 
-def get_3d_sincos_pos_embed(embed_dim, grid_size, time_scale=1.0, cls_token=False, extra_tokens=0):
+def get_3d_sincos_pos_embed(embed_dim, grid_size, time_scale=1.0, cls_token=False, extra_tokens=0, patch_temporal=1):
     """
     grid_size: tuple (T, H, W)
     time_scale: scaling factor for temporal dimension (in seconds per frame)
     returns: (T*H*W, embed_dim)
     """
     gt, gh, gw = grid_size
-    grid_t = np.arange(gt, dtype=np.float32) * time_scale  # Scale by actual time
+    pt = patch_temporal
+    # Compute patch-end times: for token index i, end frame index = i*pt + (pt-1)
+    # Treat time_scale as seconds per frame and convert to seconds per token end.
+    grid_t = (np.arange(gt, dtype=np.float32) * pt + (pt - 1)) * time_scale
     grid_h = np.arange(gh, dtype=np.float32)
     grid_w = np.arange(gw, dtype=np.float32)
     grid = np.meshgrid(grid_w, grid_h, grid_t, indexing='xy')  # w, h, t ordering

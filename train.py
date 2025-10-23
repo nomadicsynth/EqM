@@ -821,15 +821,17 @@ def main(args):
                 y = torch.as_tensor(y, device=device, dtype=torch.long)
                 time_spans = torch.as_tensor(time_spans, device=device, dtype=torch.float32)
                 num_real_frames = torch.as_tensor(num_real_frames, device=device, dtype=torch.long)
-                # Compute time_scale: seconds per patch (per video)
-                # Convert raw frame counts -> number of temporal patches
-                num_real_patches = (num_real_frames + pt - 1) // pt
-                # For single-patch (or zero timespan), time_scale is 0
+                # Compute time_scale as seconds per frame (frame duration).
+                # To scale RoPE to the actual clip length, use duration / num_frames
+                # so that e.g. 4 frames over 2s => 0.5s per frame. For zero/negative
+                # duration or zero frames, use 0.
                 time_scale = torch.where(
-                    (num_real_patches > 1) & (time_spans > 0),
-                    time_spans / (num_real_patches - 1).float(),
+                    (num_real_frames > 0) & (time_spans > 0),
+                    time_spans / num_real_frames.float(),
                     torch.zeros_like(time_spans)
                 )
+                # Number of temporal patches for the model's masking logic
+                num_real_patches = (num_real_frames + pt - 1) // pt
 
                 # --- Telemetry: log the first few batches when a curriculum phase changes ---
                 try:
@@ -939,17 +941,28 @@ def main(args):
                         for batch_data in loader:
                             if frame_count >= target_samples:
                                 break
-                            
+
+                            # Batch returned by DataLoader may be a tuple/list with
+                            # different lengths depending on dataset/sampler configuration.
+                            # For video mode the collate function returns either
+                            # (videos, labels, time_spans) or (videos, labels, time_spans, num_real_frames).
+                            # For image mode it may be (images, labels) or include extra metadata.
+                            # To be robust, always take the first element as the input frames/videos.
+                            if isinstance(batch_data, (list, tuple)):
+                                input0 = batch_data[0]
+                            else:
+                                input0 = batch_data
+
                             if getattr(args, 'video', False):
-                                x_real, _, _ = batch_data
+                                x_real = input0
                                 # x_real: (N, C, T, H, W)
                                 N, C, T, H, W = x_real.shape
                                 # Take middle frame from each video
                                 mid_frame_idx = T // 2
                                 frames = x_real[:, :, mid_frame_idx, :, :]  # (N, C, H, W)
                             else:
-                                frames, _ = batch_data
-                            
+                                frames = input0
+
                             # Process frames immediately and extract features
                             # This avoids accumulating frames in memory
                             frames = frames.to(device)
@@ -971,11 +984,28 @@ def main(args):
                     with torch.no_grad():
                         # Compute time_scale for video (temporal spacing between frames)
                         if getattr(args, 'video', False):
-                            # Calculate time_scale from video duration (seconds per patch)
-                            # e.g., 2.0s duration with 8 frames and pt=2 -> 4 patches -> seconds per patch = 2.0 / (4-1)
+                            # Calculate time_scale from video duration (seconds per interval between patches).
+                            # Training computes time_scale as duration / (num_patches - 1) (intervals between patches),
+                            # so sampling must use the same convention to be consistent. Guard against the
+                            # single-patch case (no temporal intervals) and non-positive durations to avoid
+                            # division-by-zero and to match the training-time semantics where time_scale=0.
                             patches_per_sample = (args.num_frames + pt - 1) // pt
-                            time_scale_scalar = args.sample_video_duration / (patches_per_sample - 1) if patches_per_sample > 1 else 0.0
-                            logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/patch ({args.sample_video_duration}s over {args.num_frames} frames, pt={pt})")
+                            # Prefer intervals between patches (P-1). If only one patch but
+                            # multiple raw frames exist, fall back to raw-frame intervals
+                            # (num_frames-1) so sampling preserves a non-zero temporal spacing
+                            # across the original frames (useful when pt == num_frames).
+                            if patches_per_sample > 1 and args.sample_video_duration > 0:
+                                # seconds per patch-interval
+                                time_scale_scalar = args.sample_video_duration / (patches_per_sample - 1)
+                                logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/interval ({args.sample_video_duration}s over {args.num_frames} frames, pt={pt}, patches={patches_per_sample})")
+                            elif args.num_frames > 1 and args.sample_video_duration > 0:
+                                # single patch but multiple raw frames -> use per-frame intervals
+                                time_scale_scalar = args.sample_video_duration / (args.num_frames - 1)
+                                logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/frame-interval (fallback: {args.sample_video_duration}s over {args.num_frames} frames, pt={pt}, patches={patches_per_sample})")
+                            else:
+                                # Single frame or non-positive duration: no temporal intervals
+                                time_scale_scalar = 0.0
+                                logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/interval ({args.sample_video_duration}s over {args.num_frames} frames, pt={pt}, patches={patches_per_sample})")
                         else:
                             time_scale_scalar = 1.0
                         
@@ -983,7 +1013,11 @@ def main(args):
                         generated_frames_list = []
                         num_fid_batches = (args.fid_num_samples + local_batch_size - 1) // local_batch_size if args.compute_fid else 1
                         
-                        for fid_batch_idx in range(num_fid_batches):
+                        from tqdm import tqdm as _tqdm  # local alias to avoid shadowing outer tqdm usage
+                        for fid_batch_idx in _tqdm(range(num_fid_batches),
+                                                   desc="FID batches" if rank == 0 else None,
+                                                   disable=(rank != 0),
+                                                   dynamic_ncols=True):
                             # Initialize for gradient descent sampling
                             if getattr(args, 'video', False):
                                 zs_batch = torch.randn(local_batch_size, 4, args.num_frames, latent_size, latent_size, device=device)
