@@ -569,8 +569,8 @@ def main(args):
                 x_frames = x.permute(0, 2, 1, 3, 4).reshape(N * T, C, H, W).to(device)
                 y = torch.as_tensor(y, device=device, dtype=torch.long)
                 time_spans = torch.as_tensor(time_spans, device=device, dtype=torch.float32)
-                # Compute time_scale: seconds per frame
-                time_scale = (time_spans / (T - 1)).mean().item()  # Average across batch
+                # Compute time_scale: seconds per frame (per video)
+                time_scale = time_spans / (T - 1)  # (N,) tensor, one per video
                 with torch.no_grad():
                     lat = vae.encode(x_frames).latent_dist.sample().mul_(0.18215)
                 # reshape latents back to (N, C_latent, T, latent_H, latent_W)
@@ -581,7 +581,8 @@ def main(args):
                 x, y = batch
                 x = x.to(device)
                 y = y.to(device)
-                time_scale = 1.0  # No time scaling for 2D images
+                # No time scaling for 2D images - create tensor of ones
+                time_scale = torch.ones(x.shape[0], device=device, dtype=torch.float32)
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
@@ -668,10 +669,10 @@ def main(args):
                         if getattr(args, 'video', False):
                             # Calculate time_scale from video duration
                             # e.g., 2.0s duration with 4 frames = 2.0/3 = 0.667 s/frame
-                            time_scale_sample = args.sample_video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
-                            logger.info(f"Sampling with time_scale={time_scale_sample:.4f} s/frame ({args.sample_video_duration}s over {args.num_frames} frames)")
+                            time_scale_scalar = args.sample_video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
+                            logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/frame ({args.sample_video_duration}s over {args.num_frames} frames)")
                         else:
-                            time_scale_sample = 1.0
+                            time_scale_scalar = 1.0
                         
                         # Generate multiple batches for FID if needed
                         generated_frames_list = []
@@ -694,6 +695,10 @@ def main(args):
                             xt = zs_batch.clone()
                             t = torch.ones((xt.shape[0],)).to(xt).to(device)
                             m = torch.zeros_like(xt).to(xt).to(device)
+                            
+                            # Create time_scale tensor for this batch
+                            batch_size_with_cfg = xt.shape[0]
+                            time_scale_sample = torch.full((batch_size_with_cfg,), time_scale_scalar, device=device, dtype=torch.float32)
                             
                             if use_cfg:
                                 sample_kwargs = dict(y=ys_batch, cfg_scale=args.cfg_scale, time_scale=time_scale_sample)

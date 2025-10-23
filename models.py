@@ -92,21 +92,18 @@ class RoPE3D(nn.Module):
         self.max_freq = max_freq
         self.time_scale = time_scale
         
-    def forward(self, x, grid_size, time_scale=None):
+    def forward(self, x, grid_size, time_scale):
         """
         Apply 3D RoPE to input tensor.
         
         Args:
             x: (batch, num_patches, dim) tensor
             grid_size: (t, h, w) tuple indicating patch grid dimensions
-            time_scale: optional temporal scaling factor (seconds per frame)
+            time_scale: (batch,) tensor of temporal scaling factor (seconds per frame)
         
         Returns:
             x with rotary position embeddings applied
         """
-        if time_scale is None:
-            time_scale = self.time_scale
-            
         batch_size, num_patches, dim = x.shape
         t, h, w = grid_size
         
@@ -116,25 +113,39 @@ class RoPE3D(nn.Module):
         dim_h = dim // 3
         dim_w = dim - dim_t - dim_h
         
-        # Generate position indices
-        pos_t = torch.arange(t, device=x.device, dtype=torch.float32) * time_scale
-        pos_h = torch.arange(h, device=x.device, dtype=torch.float32)
-        pos_w = torch.arange(w, device=x.device, dtype=torch.float32)
+        # Split x into batches and process each with its own time_scale
+        x_t_list, x_h_list, x_w_list = [], [], []
         
-        # Create meshgrid and flatten to match patch ordering
-        grid_t, grid_h, grid_w = torch.meshgrid(pos_t, pos_h, pos_w, indexing='ij')
-        positions = torch.stack([
-            grid_t.flatten(),
-            grid_h.flatten(), 
-            grid_w.flatten()
-        ], dim=1)  # (num_patches, 3)
+        for b in range(batch_size):
+            # Generate position indices for this batch element
+            pos_t = torch.arange(t, device=x.device, dtype=torch.float32) * time_scale[b]
+            pos_h = torch.arange(h, device=x.device, dtype=torch.float32)
+            pos_w = torch.arange(w, device=x.device, dtype=torch.float32)
+            
+            # Create meshgrid and flatten to match patch ordering
+            grid_t, grid_h, grid_w = torch.meshgrid(pos_t, pos_h, pos_w, indexing='ij')
+            positions = torch.stack([
+                grid_t.flatten(),
+                grid_h.flatten(), 
+                grid_w.flatten()
+            ], dim=1)  # (num_patches, 3)
+            
+            # Apply rotary embedding to each dimension for this batch element
+            x_b = x[b:b+1]  # (1, num_patches, dim)
+            x_t_b, x_h_b, x_w_b = x_b.split([dim_t, dim_h, dim_w], dim=-1)
+            
+            x_t_b = self.apply_rotary_emb_1d(x_t_b, positions[:, 0], dim_t)
+            x_h_b = self.apply_rotary_emb_1d(x_h_b, positions[:, 1], dim_h)
+            x_w_b = self.apply_rotary_emb_1d(x_w_b, positions[:, 2], dim_w)
+            
+            x_t_list.append(x_t_b)
+            x_h_list.append(x_h_b)
+            x_w_list.append(x_w_b)
         
-        # Apply rotary embedding to each dimension
-        x_t, x_h, x_w = x.split([dim_t, dim_h, dim_w], dim=-1)
-        
-        x_t = self.apply_rotary_emb_1d(x_t, positions[:, 0], dim_t)
-        x_h = self.apply_rotary_emb_1d(x_h, positions[:, 1], dim_h)
-        x_w = self.apply_rotary_emb_1d(x_w, positions[:, 2], dim_w)
+        # Concatenate all batch elements
+        x_t = torch.cat(x_t_list, dim=0)
+        x_h = torch.cat(x_h_list, dim=0)
+        x_w = torch.cat(x_w_list, dim=0)
         
         return torch.cat([x_t, x_h, x_w], dim=-1)
     
@@ -341,7 +352,7 @@ class SiTBlock(nn.Module):
         if use_rope:
             self.rope = RoPE3D(hidden_size)
 
-    def forward(self, x, c, grid_size=None, time_scale=1.0):
+    def forward(self, x, c, grid_size=None, time_scale=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
         # Apply RoPE before attention if enabled
@@ -532,12 +543,13 @@ class EqM(nn.Module):
         else:
             return self.pos_embed
 
-    def forward(self, x0, t, y, time_scale=1.0, return_act=False, get_energy=False, train=False):
+    def forward(self, x0, t, y, time_scale, return_act=False, get_energy=False, train=False):
         """
         Forward pass of EqM.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        time_scale: (N,) tensor of temporal scaling (seconds per frame for videos)
         """
         x0.requires_grad_(True)
         if self.uncond: # removes noise/time conditioning by setting to 0
@@ -608,9 +620,10 @@ class EqM(nn.Module):
             return x, act
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale, time_scale=1.0, return_act=False, get_energy=False, train=False):
+    def forward_with_cfg(self, x, t, y, cfg_scale, time_scale, return_act=False, get_energy=False, train=False):
         """
         Forward pass of EqM, but also batches the uncondional forward pass for classifier-free guidance.
+        time_scale: (N,) tensor of temporal scaling (seconds per frame for videos)
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
