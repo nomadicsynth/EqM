@@ -670,17 +670,43 @@ def main(args):
         model_fn = ema.forward
 
     logger.info(f"Training for {args.epochs} epochs...")
-    # IMPORTANT: don't use len(loader) here because when using CurriculumTemporalSampler
-    # the loader length (batches per epoch) changes across curriculum phases as batch_size
-    # per-GPU is halved/doubled. To keep total training steps deterministic and avoid
-    # accidentally multiplying steps when the sampler changes batch sizes, use the
-    # precomputed per-GPU batches per epoch (from dataset_size and global batch size).
+    # Determine max_train_steps. If max_steps provided, use it. Otherwise, compute a
+    # deterministic total by summing the number of batches that the sampler will yield
+    # for each epoch. This is important when using CurriculumTemporalSampler because
+    # the per-epoch batch count can change by phase; summing len(sampler) across epochs
+    # produces the true number of optimizer steps the run will execute.
     if args.max_steps is not None:
         max_train_steps = args.max_steps
     else:
-        # Use the earlier computed per-GPU batches per epoch so max_train_steps remains
-        # invariant to curriculum phase batch-size changes.
-        max_train_steps = args.epochs * per_gpu_batches_per_epoch
+        if args.use_curriculum and hasattr(sampler, '__len__'):
+            # Save current epoch to restore later
+            try:
+                saved_epoch = sampler.epoch
+            except Exception:
+                saved_epoch = None
+
+            total_steps = 0
+            for e in range(args.epochs):
+                sampler.set_epoch(e)
+                # Update dataset/frame-range for this phase so sampler length is correct
+                if hasattr(sampler, 'update_dataset_for_phase'):
+                    sampler.update_dataset_for_phase()
+                try:
+                    total_steps += len(sampler)
+                except Exception:
+                    # Fallback: estimate using per_gpu_batches_per_epoch
+                    total_steps += per_gpu_batches_per_epoch
+
+            # Restore sampler epoch
+            if saved_epoch is not None:
+                sampler.set_epoch(saved_epoch)
+                if hasattr(sampler, 'update_dataset_for_phase'):
+                    sampler.update_dataset_for_phase()
+
+            max_train_steps = int(total_steps)
+        else:
+            # Non-curriculum: use stable estimate based on dataset_size/global batch size
+            max_train_steps = args.epochs * per_gpu_batches_per_epoch
     
     # Initialize optimizer gradients for gradient accumulation
     opt.zero_grad()
@@ -698,13 +724,18 @@ def main(args):
         # Curriculum phases can change the sampler's batch_size (per-GPU), which changes
         # len(loader) for that epoch. To avoid the progress bar jumping (e.g., 110 -> 220),
         # use the precomputed `per_gpu_batches_per_epoch` as the total when curriculum is enabled.
-        if getattr(args, 'use_curriculum', False) and hasattr(sampler, 'get_current_batch_size'):
-            epoch_total = int(per_gpu_batches_per_epoch)
-        else:
+        # After updating the sampler for the current phase, ask the sampler for its
+        # current length. This is the authoritative number of batches that will be
+        # yielded this epoch. Fall back to the precomputed per_gpu_batches_per_epoch
+        # estimate only if the sampler doesn't implement __len__.
+        try:
+            epoch_total = len(sampler) if hasattr(sampler, '__len__') else int(per_gpu_batches_per_epoch)
+        except Exception:
+            # As a last resort, try len(loader) (works for non-batch_sampler case)
             try:
                 epoch_total = len(loader)
             except Exception:
-                epoch_total = None
+                epoch_total = int(per_gpu_batches_per_epoch)
 
         for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True, total=epoch_total):
             if train_steps >= max_train_steps or interrupted:
