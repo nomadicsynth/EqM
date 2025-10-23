@@ -464,8 +464,8 @@ def main(args):
         # Track number of real (non-padded) frames for each video
         num_real_frames = [v.shape[1] for v in videos]  # videos are (C, T, H, W)
         
-        # Find maximum number of frames in this batch
-        max_frames = max(num_real_frames)
+        # Pad all videos to args.num_frames by repeating the last frame
+        max_frames = args.num_frames
         
         # Pad all videos to max_frames by repeating the last frame
         padded_videos = []
@@ -487,6 +487,16 @@ def main(args):
         return videos_batch, labels_batch, time_spans_batch, num_real_frames_batch
     
     if getattr(args, 'video', False):
+        # Create clip sampler if enabled
+        clip_sampler = None
+        if getattr(args, 'use_clip_sampling', False):
+            from curriculum_sampler import TemporalClipSampler
+            clip_sampler = TemporalClipSampler(
+                clip_prob=args.clip_full_prob,
+                min_fraction=0.2,  # 20% of video duration
+                max_fraction=0.8   # 80% of video duration
+            )
+        
         dataset = VideoDataset(
             args.data_path, 
             split='train', 
@@ -494,7 +504,8 @@ def main(args):
             transform=transform,
             random_frames=args.random_frames,
             min_frames=args.min_frames,
-            single_frame_prob=args.single_frame_prob
+            single_frame_prob=args.single_frame_prob,
+            clip_sampler=clip_sampler
         )
     else:
         dataset = ImageFolder(args.data_path, transform=transform)
@@ -1032,14 +1043,10 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for AdamW optimizer")
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--ckpt", type=str, default=None,
-                        help="Path to an EqM checkpoint to continue training from")
-    parser.add_argument("--disp", action="store_true",
-                        help="Toggle to enable Dispersive Loss")
-    parser.add_argument("--uncond", type=bool, default=True,
-                        help="disable/enable noise conditioning")
-    parser.add_argument("--ebm", type=str, choices=["none", "l2", "dot", "mean"], default="none",
-                        help="energy formulation")
+    parser.add_argument("--ckpt", type=str, default=None, help="Path to an EqM checkpoint to continue training from")
+    parser.add_argument("--disp", action="store_true", help="Toggle to enable Dispersive Loss")
+    parser.add_argument("--uncond", type=bool, default=True, help="disable/enable noise conditioning")
+    parser.add_argument("--ebm", type=str, choices=["none", "l2", "dot", "mean"], default="none", help="energy formulation")
     parser.add_argument("--video", action="store_true", help="Enable video training mode")
     parser.add_argument("--num-frames", type=int, default=16, help="Maximum number of frames per video clip")
     parser.add_argument("--random-frames", action="store_true", help="Randomly sample number of frames between min-frames and num-frames for each video")

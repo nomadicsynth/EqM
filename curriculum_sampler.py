@@ -293,19 +293,19 @@ class TemporalClipSampler:
     
     Args:
         clip_prob: Probability of sampling a clip vs full video
-        min_clip_duration: Minimum clip duration (seconds)
-        max_clip_duration: Maximum clip duration (seconds)
+        min_fraction: Minimum fraction of video duration for clip (0.0-1.0)
+        max_fraction: Maximum fraction of video duration for clip (0.0-1.0)
     """
     
     def __init__(
         self,
         clip_prob: float = 0.5,
-        min_clip_duration: float = 0.5,
-        max_clip_duration: float = 1.5,
+        min_fraction: float = 0.2,
+        max_fraction: float = 0.8,
     ):
         self.clip_prob = clip_prob
-        self.min_clip_duration = min_clip_duration
-        self.max_clip_duration = max_clip_duration
+        self.min_fraction = min_fraction
+        self.max_fraction = max_fraction
     
     def should_sample_clip(self) -> bool:
         """Decide whether to sample clip or full video."""
@@ -318,20 +318,12 @@ class TemporalClipSampler:
         Returns:
             (clip_start_time, clip_end_time, clip_duration)
         """
-        # Random clip duration
-        clip_duration = np.random.uniform(self.min_clip_duration, self.max_clip_duration)
-        clip_duration = min(clip_duration, video_duration)  # Can't exceed video length
-        
-        # Ensure clip can contain target_frames with reasonable spacing
-        min_duration_for_frames = (target_frames - 1) / fps  # Minimum duration to fit frames
-        clip_duration = max(clip_duration, min_duration_for_frames * 1.2)  # Add 20% buffer
+        # Random clip duration as fraction of video length
+        fraction = np.random.uniform(self.min_fraction, self.max_fraction)
+        clip_duration = fraction * video_duration
         
         # Random start time (ensure clip fits in video)
         max_start = video_duration - clip_duration
-        if max_start <= 0:
-            # Clip must be full video
-            return 0.0, video_duration, video_duration
-        
         clip_start = np.random.uniform(0, max_start)
         clip_end = clip_start + clip_duration
         

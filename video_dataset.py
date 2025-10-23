@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message="The video decod
 
 from PIL import Image
 import numpy as np
+from curriculum_sampler import TemporalClipSampler
 
 
 class VideoDataset(Dataset):
@@ -30,6 +31,7 @@ class VideoDataset(Dataset):
         random_frames: If True, randomly sample num_frames between min_frames and num_frames
         min_frames: Minimum number of frames when random_frames=True
         single_frame_prob: Probability of returning a single frame (image) instead of video
+        clip_sampler: Optional TemporalClipSampler for sampling temporal clips
     """
     def __init__(
         self, 
@@ -40,7 +42,8 @@ class VideoDataset(Dataset):
         extensions=('.avi',),
         random_frames: bool = False,
         min_frames: int = 1,
-        single_frame_prob: float = 0.0
+        single_frame_prob: float = 0.0,
+        clip_sampler: Optional[TemporalClipSampler] = None
     ):
         super().__init__()
         self.root = root
@@ -50,6 +53,7 @@ class VideoDataset(Dataset):
         self.random_frames = random_frames
         self.min_frames = max(1, min_frames)  # Ensure at least 1 frame
         self.single_frame_prob = max(0.0, min(1.0, single_frame_prob))  # Clamp to [0, 1]
+        self.clip_sampler = clip_sampler
         csv_path = os.path.join(root, f"{split}.csv")
         self.label_dict = {}
         with open(csv_path, 'r') as f:
@@ -101,37 +105,64 @@ class VideoDataset(Dataset):
         else:
             target_frames = self.num_frames
         
-        if n_frames >= target_frames:
-            # sample target_frames frames uniformly
-            if target_frames == 1:
-                # For single frame, pick a random frame from the video
-                idx_frame = random.randint(0, n_frames - 1)
-                indices = np.array([idx_frame])
+        video_duration = n_frames / fps
+        
+        # Determine if we're sampling a clip or full video
+        if self.clip_sampler is not None and self.clip_sampler.should_sample_clip():
+            clip_start, clip_end, clip_duration = self.clip_sampler.sample_clip_params(
+                video_duration, target_frames, fps
+            )
+            # Convert to frame indices
+            start_frame = int(clip_start * fps)
+            end_frame = int(clip_end * fps)
+            clip_frames = frames[start_frame:end_frame]
+            clip_n_frames = len(clip_frames)
+            
+            if clip_n_frames >= target_frames:
+                # Sample uniformly from the clip
+                indices = np.linspace(0, clip_n_frames - 1, target_frames, dtype=int)
+                sampled_frames = clip_frames[indices]
+                time_span = clip_duration
             else:
-                indices = np.linspace(0, n_frames - 1, num=target_frames, dtype=int)
-            clip = frames[indices]
-            # Calculate actual time span of sampled frames
-            if target_frames == 1:
-                time_span = 0.0  # Single frame = no temporal extent (image)
-            else:
-                time_span = (indices[-1] - indices[0]) / fps  # in seconds
+                # Clip too short: take target_frames consecutive frames centered on clip start
+                desired_start = start_frame - (target_frames // 2)
+                actual_start = max(0, min(desired_start, n_frames - target_frames))
+                sampled_frames = frames[actual_start : actual_start + target_frames]
+                # Adjust time_span to reflect consecutive frames at video fps
+                time_span = (target_frames - 1) / fps if target_frames > 1 else 0.0
         else:
-            # pad by repeating last frame
-            indices = list(range(n_frames))
-            reps = target_frames - n_frames
-            last = frames[-1:]
-            clip = np.concatenate([frames, np.repeat(last, reps, axis=0)], axis=0)
-            # Time span is the full video duration
-            time_span = (n_frames - 1) / fps if n_frames > 1 else 0.0
+            # Original full-video sampling logic
+            if n_frames >= target_frames:
+                # sample target_frames frames uniformly
+                if target_frames == 1:
+                    # For single frame, pick a random frame from the video
+                    idx_frame = random.randint(0, n_frames - 1)
+                    indices = np.array([idx_frame])
+                else:
+                    indices = np.linspace(0, n_frames - 1, num=target_frames, dtype=int)
+                sampled_frames = frames[indices]
+                # Calculate actual time span of sampled frames
+                if target_frames == 1:
+                    time_span = 0.0  # Single frame = no temporal extent (image)
+                else:
+                    time_span = (indices[-1] - indices[0]) / fps  # in seconds
+            else:
+                # pad by repeating last frame
+                indices = list(range(n_frames))
+                reps = target_frames - n_frames
+                last = frames[-1:]
+                sampled_frames = np.concatenate([frames, np.repeat(last, reps, axis=0)], axis=0)
+                # Time span is the full video duration
+                time_span = (n_frames - 1) / fps if n_frames > 1 else 0.0
 
         # apply per-frame transform
-        pil_frames = [Image.fromarray(f) for f in clip]
+        pil_frames = [Image.fromarray(f) for f in sampled_frames]
         if self.transform is not None:
             proc = [self.transform(p) for p in pil_frames]  # each is C,H,W
             # stack to (T, C, H, W) then permute to (C, T, H, W)
             proc = torch.stack(proc, dim=0)
             proc = proc.permute(1, 0, 2, 3)
         else:
-            proc = torch.from_numpy(clip).permute(3, 0, 1, 2).float() / 255.0
+            proc = torch.from_numpy(sampled_frames).permute(3, 0, 1, 2).float() / 255.0
 
         return proc, label, time_span
