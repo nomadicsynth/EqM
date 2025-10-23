@@ -20,13 +20,36 @@ class VideoDataset(Dataset):
     """Simple Video dataset loader for UCF-101 style folders.
 
     Returns clips of shape (C, T, H, W) and a label index.
+    
+    Args:
+        root: Root directory containing videos
+        split: Dataset split ('train', 'test', etc.)
+        num_frames: Maximum number of frames per clip
+        transform: Transform to apply to each frame
+        extensions: Video file extensions to load
+        random_frames: If True, randomly sample num_frames between min_frames and num_frames
+        min_frames: Minimum number of frames when random_frames=True
+        single_frame_prob: Probability of returning a single frame (image) instead of video
     """
-    def __init__(self, root: str, split: str = 'train', num_frames: int = 16, transform=None, extensions=('.avi',)):
+    def __init__(
+        self, 
+        root: str, 
+        split: str = 'train', 
+        num_frames: int = 16, 
+        transform=None, 
+        extensions=('.avi',),
+        random_frames: bool = False,
+        min_frames: int = 1,
+        single_frame_prob: float = 0.0
+    ):
         super().__init__()
         self.root = root
         self.num_frames = num_frames
         self.transform = transform
         self.extensions = extensions
+        self.random_frames = random_frames
+        self.min_frames = max(1, min_frames)  # Ensure at least 1 frame
+        self.single_frame_prob = max(0.0, min(1.0, single_frame_prob))  # Clamp to [0, 1]
         csv_path = os.path.join(root, f"{split}.csv")
         self.label_dict = {}
         with open(csv_path, 'r') as f:
@@ -67,16 +90,35 @@ class VideoDataset(Dataset):
         n_frames = frames.shape[0]
         if n_frames == 0:
             raise ValueError(f"Video {path} has no frames")
-        if n_frames >= self.num_frames:
-            # sample num_frames frames uniformly
-            indices = np.linspace(0, n_frames - 1, num=self.num_frames, dtype=int)
+        
+        # Determine target number of frames for this sample
+        # Check if we should return a single frame (image)
+        if self.single_frame_prob > 0 and random.random() < self.single_frame_prob:
+            target_frames = 1
+        elif self.random_frames and self.min_frames < self.num_frames:
+            # Randomly sample between min_frames and num_frames
+            target_frames = random.randint(self.min_frames, self.num_frames)
+        else:
+            target_frames = self.num_frames
+        
+        if n_frames >= target_frames:
+            # sample target_frames frames uniformly
+            if target_frames == 1:
+                # For single frame, pick a random frame from the video
+                idx_frame = random.randint(0, n_frames - 1)
+                indices = np.array([idx_frame])
+            else:
+                indices = np.linspace(0, n_frames - 1, num=target_frames, dtype=int)
             clip = frames[indices]
             # Calculate actual time span of sampled frames
-            time_span = (indices[-1] - indices[0]) / fps  # in seconds
+            if target_frames == 1:
+                time_span = 0.0  # Single frame = no temporal extent (image)
+            else:
+                time_span = (indices[-1] - indices[0]) / fps  # in seconds
         else:
             # pad by repeating last frame
             indices = list(range(n_frames))
-            reps = self.num_frames - n_frames
+            reps = target_frames - n_frames
             last = frames[-1:]
             clip = np.concatenate([frames, np.repeat(last, reps, axis=0)], axis=0)
             # Time span is the full video duration

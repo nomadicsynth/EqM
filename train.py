@@ -453,8 +453,49 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
+    
+    # Custom collate function to handle variable-length video sequences
+    def video_collate_fn(batch):
+        """Collate function that pads videos to the maximum length in the batch.
+        Returns num_real_frames to enable masking of padding positions.
+        """
+        videos, labels, time_spans = zip(*batch)
+        
+        # Track number of real (non-padded) frames for each video
+        num_real_frames = [v.shape[1] for v in videos]  # videos are (C, T, H, W)
+        
+        # Find maximum number of frames in this batch
+        max_frames = max(num_real_frames)
+        
+        # Pad all videos to max_frames by repeating the last frame
+        padded_videos = []
+        for video in videos:
+            C, T, H, W = video.shape
+            if T < max_frames:
+                # Repeat last frame to reach max_frames
+                last_frame = video[:, -1:, :, :]  # (C, 1, H, W)
+                padding = last_frame.repeat(1, max_frames - T, 1, 1)  # (C, max_frames-T, H, W)
+                video = torch.cat([video, padding], dim=1)  # (C, max_frames, H, W)
+            padded_videos.append(video)
+        
+        # Stack into batch
+        videos_batch = torch.stack(padded_videos, dim=0)  # (N, C, T, H, W)
+        labels_batch = torch.tensor(labels, dtype=torch.long)
+        time_spans_batch = torch.tensor(time_spans, dtype=torch.float32)
+        num_real_frames_batch = torch.tensor(num_real_frames, dtype=torch.long)
+        
+        return videos_batch, labels_batch, time_spans_batch, num_real_frames_batch
+    
     if getattr(args, 'video', False):
-        dataset = VideoDataset(args.data_path, split='train', num_frames=args.num_frames, transform=transform)
+        dataset = VideoDataset(
+            args.data_path, 
+            split='train', 
+            num_frames=args.num_frames, 
+            transform=transform,
+            random_frames=args.random_frames,
+            min_frames=args.min_frames,
+            single_frame_prob=args.single_frame_prob
+        )
     else:
         dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
@@ -472,10 +513,15 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True if args.num_workers > 0 else False
+        persistent_workers=True if args.num_workers > 0 else False,
+        collate_fn=video_collate_fn if getattr(args, 'video', False) else None
     )
     if isinstance(dataset, VideoDataset):
         logger.info(f"Dataset contains {len(dataset):,} videos ({args.data_path})")
+        if args.random_frames:
+            logger.info(f"Random frame sampling enabled: {args.min_frames}-{args.num_frames} frames per clip")
+        if args.single_frame_prob > 0:
+            logger.info(f"Single-frame probability: {args.single_frame_prob:.2%} (image augmentation)")
     else:
         logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
@@ -562,15 +608,22 @@ def main(args):
             if train_steps >= max_train_steps or interrupted:
                 break
             if getattr(args, 'video', False):
-                x, y, time_spans = batch
-                # x: (N, C, T, H, W), time_spans: (N,) in seconds
+                x, y, time_spans, num_real_frames = batch
+                # x: (N, C, T, H, W), time_spans: (N,) in seconds, num_real_frames: (N,) frame counts
                 N, C, T, H, W = x.shape
                 # encode frames by flattening N*T into batch for the VAE
                 x_frames = x.permute(0, 2, 1, 3, 4).reshape(N * T, C, H, W).to(device)
                 y = torch.as_tensor(y, device=device, dtype=torch.long)
                 time_spans = torch.as_tensor(time_spans, device=device, dtype=torch.float32)
+                num_real_frames = torch.as_tensor(num_real_frames, device=device, dtype=torch.long)
                 # Compute time_scale: seconds per frame (per video)
-                time_scale = time_spans / (T - 1)  # (N,) tensor, one per video
+                # For single frames (T=1 or time_spans=0), time_scale is 0
+                # Use num_real_frames instead of T for accurate time_scale
+                time_scale = torch.where(
+                    (num_real_frames > 1) & (time_spans > 0),
+                    time_spans / (num_real_frames - 1).float(),
+                    torch.zeros_like(time_spans)
+                )
                 with torch.no_grad():
                     lat = vae.encode(x_frames).latent_dist.sample().mul_(0.18215)
                 # reshape latents back to (N, C_latent, T, latent_H, latent_W)
@@ -587,7 +640,13 @@ def main(args):
                     # Map input images to latent space + normalize latents:
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
 
-            model_kwargs = dict(y=y, time_scale=time_scale, return_act=args.disp, train=True)
+            model_kwargs = dict(
+                y=y, 
+                time_scale=time_scale, 
+                return_act=args.disp, 
+                train=True,
+                num_real_frames=num_real_frames if getattr(args, 'video', False) else None
+            )
 
             # Use automatic mixed precision if enabled
             with autocast(device_type='cuda', dtype=autocast_dtype, enabled=args.use_amp or args.use_bf16):
@@ -916,7 +975,10 @@ if __name__ == "__main__":
     parser.add_argument("--ebm", type=str, choices=["none", "l2", "dot", "mean"], default="none",
                         help="energy formulation")
     parser.add_argument("--video", action="store_true", help="Enable video training mode")
-    parser.add_argument("--num-frames", type=int, default=16, help="Number of frames per video clip")
+    parser.add_argument("--num-frames", type=int, default=16, help="Maximum number of frames per video clip")
+    parser.add_argument("--random-frames", action="store_true", help="Randomly sample number of frames between min-frames and num-frames for each video")
+    parser.add_argument("--min-frames", type=int, default=1, help="Minimum number of frames when using --random-frames (default: 1)")
+    parser.add_argument("--single-frame-prob", type=float, default=0.0, help="Probability (0.0-1.0) of extracting a single frame (image) from each video (default: 0.0)")
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps (overrides epochs)")
     parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision training (FP16)")
     parser.add_argument("--use-bf16", action="store_true", help="Enable bfloat16 mixed precision training (BF16)")

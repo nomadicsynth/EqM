@@ -6,7 +6,7 @@ import torch.distributed as dist
 import enum
 
 from . import path
-from .utils import EasyDict, log_state, mean_flat
+from .utils import EasyDict, log_state, mean_flat, mean_flat_masked
 from .integrators import ode, sde
 
 class ModelType(enum.Enum):
@@ -140,6 +140,19 @@ class Transport:
         if model_kwargs == None: 
             model_kwargs = {}
         
+        # Extract mask for variable-length sequences
+        num_real_frames = model_kwargs.get('num_real_frames', None)
+        attn_mask = None
+        if num_real_frames is not None and x1.ndim == 5:
+            # Create mask for loss computation
+            # x1 is (B, C, T, H, W) video tensor
+            from models import create_temporal_mask
+            B, C, T, H, W = x1.shape
+            # Assuming patch_size - we need grid_size to create mask
+            # For now, create a simple temporal mask
+            # TODO: Get actual patch sizes from model
+            attn_mask = create_temporal_mask(num_real_frames, (T, H, W), x1.device)
+        
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         # get_ct returns shape (B,) -- reshape to broadcast over ut's remaining dimensions
@@ -160,7 +173,7 @@ class Transport:
         terms = {}
         terms['pred'] = model_output
         if self.model_type == ModelType.VELOCITY:
-            terms['loss'] = mean_flat(((model_output - ut) ** 2))
+            terms['loss'] = mean_flat_masked(((model_output - ut) ** 2), attn_mask)
         else: 
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
@@ -174,9 +187,9 @@ class Transport:
                 raise NotImplementedError()
             
             if self.model_type == ModelType.NOISE:
-                terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2))
+                terms['loss'] = mean_flat_masked(weight * ((model_output - x0) ** 2), attn_mask)
             else:
-                terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
+                terms['loss'] = mean_flat_masked(weight * ((model_output * sigma_t + x0) ** 2), attn_mask)
         terms['loss'] += 0.5*disp_loss      
         return terms
     

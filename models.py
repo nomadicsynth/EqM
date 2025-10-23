@@ -76,6 +76,38 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+def create_temporal_mask(num_real_frames, grid_size, device):
+    """
+    Create attention mask for padded video sequences.
+    
+    Args:
+        num_real_frames: (B,) tensor of real frame counts per video
+        grid_size: (t, h, w) tuple of patch grid dimensions
+        device: torch device
+    
+    Returns:
+        mask: (B, num_patches) boolean tensor where True = valid, False = padding
+    """
+    if num_real_frames is None:
+        return None
+    
+    t, h, w = grid_size
+    B = num_real_frames.shape[0]
+    num_patches = t * h * w
+    
+    # Create mask: True for valid positions, False for padding
+    mask = torch.zeros(B, num_patches, dtype=torch.bool, device=device)
+    
+    for b in range(B):
+        real_t = num_real_frames[b].item()
+        # All spatial patches are valid, but only first real_t temporal patches
+        # Patches are ordered as: (t=0, h, w), (t=1, h, w), ..., (t=T-1, h, w)
+        valid_patches = real_t * h * w
+        mask[b, :valid_patches] = True
+    
+    return mask
+
+
 #################################################################################
 #                          Rotary Position Embedding (RoPE)                     #
 #################################################################################
@@ -352,7 +384,7 @@ class SiTBlock(nn.Module):
         if use_rope:
             self.rope = RoPE3D(hidden_size)
 
-    def forward(self, x, c, grid_size=None, time_scale=None):
+    def forward(self, x, c, grid_size=None, time_scale=None, attn_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
         # Apply RoPE before attention if enabled
@@ -360,8 +392,44 @@ class SiTBlock(nn.Module):
         if self.use_rope and grid_size is not None:
             x_normed = self.rope(x_normed, grid_size, time_scale)
         
-        x = x + gate_msa.unsqueeze(1) * self.attn(x_normed)
+        # Apply attention with optional masking
+        if attn_mask is not None:
+            # timm's Attention doesn't support attn_mask directly, so we'll use a workaround
+            # Store original attention and apply mask via hook or manual implementation
+            # For now, use manual scaled dot-product attention
+            attn_output = self._masked_attention(x_normed, attn_mask)
+        else:
+            attn_output = self.attn(x_normed)
+        
+        x = x + gate_msa.unsqueeze(1) * attn_output
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+    
+    def _masked_attention(self, x, attn_mask):
+        """
+        Manual attention computation with masking support.
+        attn_mask: (B, N) boolean mask where True = valid position, False = padding
+        """
+        B, N, C = x.shape
+        # Use the existing attention's qkv projection
+        qkv = self.attn.qkv(x).reshape(B, N, 3, self.attn.num_heads, C // self.attn.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # (B, num_heads, N, head_dim)
+        
+        # Compute attention scores
+        attn = (q @ k.transpose(-2, -1)) * self.attn.scale  # (B, num_heads, N, N)
+        
+        # Apply mask: set padding positions to -inf so they get 0 attention after softmax
+        if attn_mask is not None:
+            # attn_mask is (B, N), expand to (B, 1, 1, N) for broadcasting
+            mask = attn_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N)
+            attn = attn.masked_fill(~mask, float('-inf'))
+        
+        attn = attn.softmax(dim=-1)
+        attn = self.attn.attn_drop(attn)
+        
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.attn.proj(x)
+        x = self.attn.proj_drop(x)
         return x
 
 
@@ -543,13 +611,14 @@ class EqM(nn.Module):
         else:
             return self.pos_embed
 
-    def forward(self, x0, t, y, time_scale, return_act=False, get_energy=False, train=False):
+    def forward(self, x0, t, y, time_scale, return_act=False, get_energy=False, train=False, num_real_frames=None):
         """
         Forward pass of EqM.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         time_scale: (N,) tensor of temporal scaling (seconds per frame for videos)
+        num_real_frames: (N,) tensor of real (non-padded) frame counts for masking
         """
         x0.requires_grad_(True)
         if self.uncond: # removes noise/time conditioning by setting to 0
@@ -569,7 +638,7 @@ class EqM(nn.Module):
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         
-        # Get grid size for RoPE
+        # Get grid size for RoPE and masking
         if self.use_rope and self.is3d:
             # Dynamically compute grid size from input
             N, C, T, H, W = x0.shape
@@ -584,12 +653,24 @@ class EqM(nn.Module):
         else:
             grid_size = None
         
+        # Create attention mask for variable-length sequences
+        if self.is3d and grid_size is not None:
+            N, C, T, H, W = x0.shape
+            if isinstance(self.patch_size, int):
+                pt = ph = pw = self.patch_size
+            else:
+                pt, ph, pw = self.patch_size
+            mask_grid_size = (T // pt, H // ph, W // pw)
+            attn_mask = create_temporal_mask(num_real_frames, mask_grid_size, x0.device)
+        else:
+            attn_mask = None
+        
         # Transformer blocks
         for block in self.blocks:
             if self.use_rope:
-                x = block(x, c, grid_size=grid_size, time_scale=time_scale)
+                x = block(x, c, grid_size=grid_size, time_scale=time_scale, attn_mask=attn_mask)
             else:
-                x = block(x, c)
+                x = block(x, c, attn_mask=attn_mask)
             act.append(x)
             
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
@@ -620,15 +701,16 @@ class EqM(nn.Module):
             return x, act
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale, time_scale, return_act=False, get_energy=False, train=False):
+    def forward_with_cfg(self, x, t, y, cfg_scale, time_scale, return_act=False, get_energy=False, train=False, num_real_frames=None):
         """
         Forward pass of EqM, but also batches the uncondional forward pass for classifier-free guidance.
         time_scale: (N,) tensor of temporal scaling (seconds per frame for videos)
+        num_real_frames: (N,) tensor of real (non-padded) frame counts for masking
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y, time_scale=time_scale, return_act=return_act, get_energy=get_energy, train=train)
+        model_out = self.forward(combined, t, y, time_scale=time_scale, return_act=return_act, get_energy=get_energy, train=train, num_real_frames=num_real_frames)
         if get_energy:
             x, E = model_out
             model_out=x
