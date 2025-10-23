@@ -168,17 +168,50 @@ def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-        )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
+    class TqdmLoggingHandler(logging.Handler):
+        """Logging handler that uses tqdm.write to avoid breaking progress bars."""
+        def __init__(self, level=logging.NOTSET):
+            super().__init__(level)
+
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                # Use tqdm.write which is safe with tqdm progress bars
+                from tqdm import tqdm
+                tqdm.write(msg)
+            except Exception:
+                self.handleError(record)
+
+    logger = logging.getLogger(__name__)
+    # If rank 0, attach a tqdm-safe console handler and a file handler
+    if dist.get_rank() == 0:
+        logger.setLevel(logging.INFO)
+        # Clear existing handlers to avoid duplicate logs when reusing logger
+        logger.handlers = []
+
+        console_handler = TqdmLoggingHandler()
+        # Colored timestamp for console (blue) similar to previous behavior
+        colored_fmt = '\033[34m%(asctime)s\033[0m %(message)s'
+        console_formatter = logging.Formatter(f'[{colored_fmt}', datefmt='%Y-%m-%d %H:%M:%S')
+        # The console formatter should wrap the timestamp in brackets like before
+        # e.g., [[34m2025-10-23 12:34:56[0m] message
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+
+        # File handler (if a logging_dir was provided) - use plain formatting
+        if logging_dir is not None:
+            try:
+                file_formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+                fh = logging.FileHandler(f"{logging_dir}/log.txt")
+                fh.setFormatter(file_formatter)
+                logger.addHandler(fh)
+            except Exception:
+                # If file handler cannot be created, log to console only
+                logger.warning(f"Could not create log file at {logging_dir}/log.txt")
+    else:
+        # Non-zero ranks get a NullHandler to avoid noisy logging
         logger.addHandler(logging.NullHandler())
+
     return logger
 
 
@@ -455,35 +488,62 @@ def main(args):
     ])
     
     # Custom collate function to handle variable-length video sequences
+    # Determine the minimum temporal frames required by the model's patch embedding
+    try:
+        _x_embed = model.module.x_embedder if hasattr(model, 'module') else model.x_embedder
+        # temporal patch size (pt): how many raw frames map to one temporal patch
+        pt = int(_x_embed.patch_size[0])
+        min_required_frames = pt
+    except Exception:
+        # Fallback: require at least 1 temporal frame / patch
+        pt = 1
+        min_required_frames = 1
+
     def video_collate_fn(batch):
-        """Collate function that pads videos to the maximum length in the batch.
-        Returns num_real_frames to enable masking of padding positions.
+        """Collate function for variable-length video sequences.
+
+        Requirements from curriculum: each sample may request a different
+        number of REAL frames (target_frames). We must NOT silently reduce
+        the number of real frames for any clip. Padding is allowed only to
+        make all clips in the batch the same length so they can be stacked.
+
+        Returns:
+            videos_batch: (N, C, T_max, H, W) tensor where T_max is the
+                maximum target-frames among samples in this batch.
+            labels_batch, time_spans_batch, num_real_frames_batch: tensors
+                preserving the true (non-padded) frame counts per sample.
         """
         videos, labels, time_spans = zip(*batch)
-        
+
         # Track number of real (non-padded) frames for each video
         num_real_frames = [v.shape[1] for v in videos]  # videos are (C, T, H, W)
-        
-        # Pad all videos to args.num_frames by repeating the last frame
-        max_frames = args.num_frames
-        
-        # Pad all videos to max_frames by repeating the last frame
+
+        # Use the maximum target-frames present in this batch (not args.num_frames).
+        # Ensure it's at least the model's temporal patch size and pad to the
+        # nearest multiple of the temporal patch size (pt) so Conv3d patching
+        # produces an integer number of temporal patches.
+        batch_max_frames = max(max(num_real_frames), min_required_frames)
+        # Ceil to nearest multiple of pt
+        if pt > 1 and (batch_max_frames % pt) != 0:
+            batch_max_frames = ((batch_max_frames + pt - 1) // pt) * pt
+
+        # Pad all videos to batch_max_frames by repeating the last frame only when needed
         padded_videos = []
         for video in videos:
             C, T, H, W = video.shape
-            if T < max_frames:
-                # Repeat last frame to reach max_frames
+            if T < batch_max_frames:
+                # Repeat last frame to reach batch_max_frames
                 last_frame = video[:, -1:, :, :]  # (C, 1, H, W)
-                padding = last_frame.repeat(1, max_frames - T, 1, 1)  # (C, max_frames-T, H, W)
-                video = torch.cat([video, padding], dim=1)  # (C, max_frames, H, W)
+                padding = last_frame.repeat(1, batch_max_frames - T, 1, 1)
+                video = torch.cat([video, padding], dim=1)  # (C, batch_max_frames, H, W)
             padded_videos.append(video)
-        
+
         # Stack into batch
         videos_batch = torch.stack(padded_videos, dim=0)  # (N, C, T, H, W)
         labels_batch = torch.tensor(labels, dtype=torch.long)
         time_spans_batch = torch.tensor(time_spans, dtype=torch.float32)
         num_real_frames_batch = torch.tensor(num_real_frames, dtype=torch.long)
-        
+
         return videos_batch, labels_batch, time_spans_batch, num_real_frames_batch
     
     if getattr(args, 'video', False):
@@ -580,12 +640,18 @@ def main(args):
     # (i.e., acts as a batch_sampler). Detect this by checking for the sampler API
     # method `get_current_batch_size` which CurriculumTemporalSampler provides.
     if getattr(args, 'use_curriculum', False) and hasattr(sampler, 'get_current_batch_size'):
+        # IMPORTANT: Do not use persistent_workers when curriculum updates dataset
+        # attributes at runtime (e.g., set_frame_range). Persistent workers keep
+        # copies of the Dataset in worker processes, so updates made in the main
+        # process won't be visible to them. Disable persistent_workers so workers
+        # are recreated and pick up updated frame ranges when the sampler calls
+        # update_dataset_for_phase().
         loader = DataLoader(
             dataset,
             batch_sampler=sampler,
             num_workers=args.num_workers,
             pin_memory=True,
-            persistent_workers=True if args.num_workers > 0 else False,
+            persistent_workers=False,
             collate_fn=video_collate_fn if getattr(args, 'video', False) else None,
         )
     else:
@@ -737,7 +803,9 @@ def main(args):
             except Exception:
                 epoch_total = int(per_gpu_batches_per_epoch)
 
-        for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True, total=epoch_total):
+        prev_phase_key = None
+        phase_logged_batches = 0
+        for batch_idx, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True, total=epoch_total)):
             if train_steps >= max_train_steps or interrupted:
                 break
             if getattr(args, 'video', False):
@@ -749,14 +817,53 @@ def main(args):
                 y = torch.as_tensor(y, device=device, dtype=torch.long)
                 time_spans = torch.as_tensor(time_spans, device=device, dtype=torch.float32)
                 num_real_frames = torch.as_tensor(num_real_frames, device=device, dtype=torch.long)
-                # Compute time_scale: seconds per frame (per video)
-                # For single frames (T=1 or time_spans=0), time_scale is 0
-                # Use num_real_frames instead of T for accurate time_scale
+                # Compute time_scale: seconds per patch (per video)
+                # Convert raw frame counts -> number of temporal patches
+                num_real_patches = (num_real_frames + pt - 1) // pt
+                # For single-patch (or zero timespan), time_scale is 0
                 time_scale = torch.where(
-                    (num_real_frames > 1) & (time_spans > 0),
-                    time_spans / (num_real_frames - 1).float(),
+                    (num_real_patches > 1) & (time_spans > 0),
+                    time_spans / (num_real_patches - 1).float(),
                     torch.zeros_like(time_spans)
                 )
+
+                # --- Telemetry: log the first few batches when a curriculum phase changes ---
+                try:
+                    # Determine current phase key from dataset and sampler (min_frames, num_frames, batch_size)
+                    current_min = getattr(dataset, 'min_frames', None)
+                    current_num = getattr(dataset, 'num_frames', None)
+                    current_bs = sampler.get_current_batch_size() if hasattr(sampler, 'get_current_batch_size') else local_batch_size
+                    current_phase_key = (int(current_min) if current_min is not None else None,
+                                         int(current_num) if current_num is not None else None,
+                                         int(current_bs))
+                except Exception:
+                    current_phase_key = None
+
+                if rank == 0:
+                    # If phase changed, reset counter and log phase header
+                    if current_phase_key != prev_phase_key:
+                        prev_phase_key = current_phase_key
+                        phase_logged_batches = 0
+                        logger.info(f"Curriculum phase changed: min_frames={current_phase_key[0]}, num_frames={current_phase_key[1]}, batch_size_per_gpu={current_phase_key[2]}")
+
+                    # Log detailed batch telemetry for the first few batches of this phase
+                    if phase_logged_batches < 5:
+                        # Compute padded T for this batch and tokens
+                        raw_frames = num_real_frames.cpu().numpy()
+                        patch_counts = ((raw_frames + pt - 1) // pt)
+                        # spatial grid from patch embed (t,h,w) -> h,w
+                        try:
+                            spatial = _x_embed.spatial_grid_size
+                            h_grid, w_grid = int(spatial[0]), int(spatial[1])
+                        except Exception:
+                            h_grid, w_grid = 1, 1
+                        tokens_per_sample = patch_counts * h_grid * w_grid
+                        avg_tokens = float(tokens_per_sample.mean())
+                        tokens_per_step = avg_tokens * float(current_bs)
+                        max_raw = int(raw_frames.max())
+                        padded_to = int(((max_raw + pt - 1) // pt) * pt)
+                        logger.info(f" batch={batch_idx}: raw_frames_min={int(raw_frames.min())}, raw_frames_max={max_raw}, padded_to={padded_to}, pt={pt}, patches_min={int(patch_counts.min())}, patches_max={int(patch_counts.max())}, avg_tokens/sample={avg_tokens:.1f}, tokens/step~{tokens_per_step:.1f}")
+                        phase_logged_batches += 1
                 with torch.no_grad():
                     lat = vae.encode(x_frames).latent_dist.sample().mul_(0.18215)
                 # reshape latents back to (N, C_latent, T, latent_H, latent_W)
@@ -773,12 +880,13 @@ def main(args):
                     # Map input images to latent space + normalize latents:
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
 
+            # Pass number of real PATCHES to the model (used for masking), not raw frames
             model_kwargs = dict(
-                y=y, 
-                time_scale=time_scale, 
-                return_act=args.disp, 
+                y=y,
+                time_scale=time_scale,
+                return_act=args.disp,
                 train=True,
-                num_real_frames=num_real_frames if getattr(args, 'video', False) else None
+                num_real_frames=num_real_patches if getattr(args, 'video', False) else None
             )
 
             # Use automatic mixed precision if enabled
@@ -859,10 +967,11 @@ def main(args):
                     with torch.no_grad():
                         # Compute time_scale for video (temporal spacing between frames)
                         if getattr(args, 'video', False):
-                            # Calculate time_scale from video duration
-                            # e.g., 2.0s duration with 4 frames = 2.0/3 = 0.667 s/frame
-                            time_scale_scalar = args.sample_video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
-                            logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/frame ({args.sample_video_duration}s over {args.num_frames} frames)")
+                            # Calculate time_scale from video duration (seconds per patch)
+                            # e.g., 2.0s duration with 8 frames and pt=2 -> 4 patches -> seconds per patch = 2.0 / (4-1)
+                            patches_per_sample = (args.num_frames + pt - 1) // pt
+                            time_scale_scalar = args.sample_video_duration / (patches_per_sample - 1) if patches_per_sample > 1 else 0.0
+                            logger.info(f"Sampling with time_scale={time_scale_scalar:.4f} s/patch ({args.sample_video_duration}s over {args.num_frames} frames, pt={pt})")
                         else:
                             time_scale_scalar = 1.0
                         
