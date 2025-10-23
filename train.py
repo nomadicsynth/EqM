@@ -982,7 +982,22 @@ def main(args):
                 dist.barrier()
             
             # Log training metrics (and samples if generated at this step):
-            if train_steps % args.log_every == 0:
+            # When using curriculum the per-GPU batch size may change across phases.
+            # To keep the number of logs per epoch roughly constant, scale the
+            # logging frequency by the factor (base_batch / current_phase_batch).
+            if getattr(args, 'use_curriculum', False) and hasattr(sampler, 'get_current_batch_size'):
+                try:
+                    current_bs = sampler.get_current_batch_size()
+                    base_bs = local_batch_size
+                    # factor >= 1 (if current_bs is smaller than base_bs)
+                    factor = max(1, int(base_bs // max(1, current_bs)))
+                except Exception:
+                    factor = 1
+                effective_log_every = max(1, args.log_every * factor)
+            else:
+                effective_log_every = args.log_every
+
+            if train_steps % effective_log_every == 0:
                 # Measure training speed:
                 torch.cuda.synchronize()
                 end_time = time()
