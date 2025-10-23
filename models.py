@@ -598,15 +598,23 @@ class EqM(nn.Module):
             imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
             return imgs
 
-    def get_pos_embed(self, time_scale=1.0):
+    def get_pos_embed(self, time_scale=1.0, grid_size=None):
         """
         Compute positional embedding based on time_scale.
         For 3D models, this scales the temporal dimension.
         For 2D models, returns the fixed pos_embed.
+        
+        Args:
+            time_scale: Temporal scaling factor (seconds per frame)
+            grid_size: Optional (t, h, w) tuple. If None, uses self.grid_size from training.
         """
         if self.is3d:
+            # Use provided grid_size if available (for variable-length inference)
+            # Otherwise fall back to training grid_size
+            if grid_size is None:
+                grid_size = self.grid_size
             # Compute dynamic positional embedding with time scaling
-            pos_embed = get_3d_sincos_pos_embed(self.hidden_size, self.grid_size, time_scale=time_scale)
+            pos_embed = get_3d_sincos_pos_embed(self.hidden_size, grid_size, time_scale=time_scale)
             return torch.from_numpy(pos_embed).float().unsqueeze(0).to(self.pos_embed_default.device)
         else:
             return self.pos_embed
@@ -628,9 +636,20 @@ class EqM(nn.Module):
         # Embed patches
         x = self.x_embedder(x0)  # (N, num_patches, D)
         
+        # Compute actual grid size from input for dynamic positional embeddings
+        if self.is3d:
+            N, C, T, H, W = x0.shape
+            if isinstance(self.patch_size, int):
+                pt = ph = pw = self.patch_size
+            else:
+                pt, ph, pw = self.patch_size
+            actual_grid_size = (T // pt, H // ph, W // pw)
+        else:
+            actual_grid_size = None
+        
         # Add positional embedding if not using RoPE
         if not self.use_rope:
-            pos_embed = self.get_pos_embed(time_scale)
+            pos_embed = self.get_pos_embed(time_scale, grid_size=actual_grid_size)
             x = x + pos_embed
         
         # Get conditioning

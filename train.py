@@ -498,35 +498,97 @@ def main(args):
         )
     else:
         dataset = ImageFolder(args.data_path, transform=transform)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=local_batch_size,
-        shuffle=False,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=video_collate_fn if getattr(args, 'video', False) else None
-    )
+    
+    # Compute per-epoch batches and max training steps BEFORE creating the sampler/loader
+    # This lets us compute curriculum phase lengths deterministically and create the sampler once.
+    dataset_size = len(dataset)
+    # Global batches per epoch (using global batch size)
+    import math
+    global_batches_per_epoch = math.ceil(dataset_size / float(args.global_batch_size))
+    # Batches per GPU/process per epoch
+    per_gpu_batches_per_epoch = math.ceil(global_batches_per_epoch / float(dist.get_world_size()))
+    # Compute total training steps we will run (per-GPU steps)
+    max_train_steps = args.max_steps if args.max_steps is not None else int(args.epochs * per_gpu_batches_per_epoch)
+
     if isinstance(dataset, VideoDataset):
-        logger.info(f"Dataset contains {len(dataset):,} videos ({args.data_path})")
+        logger.info(f"Dataset contains {dataset_size:,} videos ({args.data_path})")
         if args.random_frames:
             logger.info(f"Random frame sampling enabled: {args.min_frames}-{args.num_frames} frames per clip")
         if args.single_frame_prob > 0:
             logger.info(f"Single-frame probability: {args.single_frame_prob:.2%} (image augmentation)")
     else:
-        logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+        logger.info(f"Dataset contains {dataset_size:,} images ({args.data_path})")
+
+    # Create sampler (curriculum if enabled, otherwise standard distributed)
+    if args.use_curriculum and isinstance(dataset, VideoDataset):
+        from curriculum_sampler import CurriculumTemporalSampler
+
+        # Compute number of curriculum phases from local batch size by halving until 1
+        num_phases = 0
+        tmp_bs = local_batch_size
+        while True:
+            num_phases += 1
+            if tmp_bs == 1:
+                break
+            tmp_bs = max(1, tmp_bs // 2)
+
+        computed_steps_per_phase = max(1, max_train_steps // max(1, num_phases))
+
+        sampler = CurriculumTemporalSampler(
+            dataset,
+            batch_size=local_batch_size,
+            max_frames=args.num_frames,
+            world_size=dist.get_world_size(),
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+            seed=args.global_seed,
+            steps_per_phase=computed_steps_per_phase,
+        )
+        logger.info(f"Curriculum learning: {len(sampler.curriculum_schedule)} phases, {computed_steps_per_phase} steps/phase, {max_train_steps} total steps")
+        try:
+            sampler.describe(world_size=dist.get_world_size())
+        except Exception:
+            logger.info("(Failed to print curriculum description)")
+    else:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed
+        )
+
+    # Create DataLoader using the sampler we just created
+    # Note: CurriculumTemporalSampler yields full batches of indices (i.e., acts as a batch_sampler).
+    # When using it we must pass it as `batch_sampler` to DataLoader and not provide `batch_size` or `sampler`.
+    # If the sampler implements curriculum behaviour it yields full batches of indices
+    # (i.e., acts as a batch_sampler). Detect this by checking for the sampler API
+    # method `get_current_batch_size` which CurriculumTemporalSampler provides.
+    if getattr(args, 'use_curriculum', False) and hasattr(sampler, 'get_current_batch_size'):
+        loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+            collate_fn=video_collate_fn if getattr(args, 'video', False) else None,
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=local_batch_size,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+            collate_fn=video_collate_fn if getattr(args, 'video', False) else None
+        )
+    
 
     # Setup learning rate scheduler
-    max_train_steps = args.max_steps if args.max_steps is not None else args.epochs * len(loader)
     if args.lr_schedule == 'cosine':
         import math
         def cosine_schedule(step):
@@ -603,6 +665,10 @@ def main(args):
         if train_steps >= max_train_steps or interrupted:
             break
         sampler.set_epoch(epoch)
+        # Update curriculum sampler with current step
+        if args.use_curriculum and isinstance(dataset, VideoDataset):
+            sampler.set_step(train_steps)
+        
         # logger.info(f"Beginning epoch {epoch}...")
         for batch in tqdm(loader, desc=f"Epoch {epoch}", disable=rank != 0, leave=False, unit="batch", dynamic_ncols=True):
             if train_steps >= max_train_steps or interrupted:
@@ -988,6 +1054,15 @@ if __name__ == "__main__":
     parser.add_argument("--muon-patch-embed", action="store_true", help="Apply Muon to patch embedding projection layer (experimental)")
     parser.add_argument("--use-compile", action="store_true", help="Use torch.compile() for faster training (requires PyTorch 2.0+)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Number of gradient accumulation steps (allows larger effective batch size with less VRAM)")
+    
+    # Curriculum learning arguments
+    parser.add_argument("--use-curriculum", action="store_true", help="Enable curriculum learning: automatically double frame count and halve batch size each phase (steps per phase computed from total training length)")
+    
+    # Clip sampling arguments
+    parser.add_argument("--use-clip-sampling", action="store_true", help="Sample temporal clips from videos for finer motion detail")
+    parser.add_argument("--clip-full-prob", type=float, default=0.3, help="Probability of using full video (default: 0.3)")
+    parser.add_argument("--clip-center-prob", type=float, default=0.4, help="Probability of using center-biased clip (default: 0.4)")
+    parser.add_argument("--center-bias-fraction", type=float, default=0.6, help="Fraction of video center to bias towards (default: 0.6)")
 
     parse_transport_args(parser)
     args = parser.parse_args()
