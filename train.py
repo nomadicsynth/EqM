@@ -618,6 +618,7 @@ def main(args):
             drop_last=True,
             seed=args.global_seed,
             epochs_per_phase=computed_epochs_per_phase,
+            logger=logger,
         )
         logger.info(f"Curriculum learning: {len(sampler.curriculum_schedule)} phases, {computed_epochs_per_phase} epochs/phase, {args.epochs} total epochs")
         try:

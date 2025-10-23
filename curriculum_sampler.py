@@ -9,9 +9,14 @@ Key Ideas:
 """
 import torch
 import numpy as np
+import logging
 from torch.utils.data import Sampler
 from typing import List, Tuple, Iterator, Optional
 import math
+
+# Module-level fallback logger. Prefer the training script to pass its logger
+# into the sampler via the `logger` argument to CurriculumTemporalSampler.__init__.
+logger = logging.getLogger(__name__)
 
 
 class CurriculumTemporalSampler(Sampler):
@@ -55,6 +60,7 @@ class CurriculumTemporalSampler(Sampler):
         drop_last: bool = True,
         seed: int = 0,
         epochs_per_phase: int = 1,
+        logger: Optional[logging.Logger] = None,
     ):
         self.dataset = dataset
         self.default_batch_size = batch_size
@@ -90,6 +96,15 @@ class CurriculumTemporalSampler(Sampler):
         # Create buckets for each phase
         self.phase_buckets = self._create_phase_buckets()
         
+        # Use provided logger if available; otherwise fall back to module logger.
+        # Training script should pass its `logger` (created via create_logger(...))
+        # to ensure identical handlers/formatting. We avoid importing train.py at
+        # module import time to prevent import-order issues.
+        if logger is not None:
+            self.logger = logger
+        else:
+            self.logger = logger or logging.getLogger(__name__)
+
         # Do not print schedule here; caller (training script) will describe the final schedule
     
     def _create_phase_buckets(self):
@@ -124,15 +139,15 @@ class CurriculumTemporalSampler(Sampler):
 
         Call this after the sampler is final (e.g. after epochs_per_phase is computed).
         """
-        # Only print from rank 0 in distributed runs to avoid duplicate logs
+        # Only log from rank 0 in distributed runs to avoid duplicate logs
         if rank != 0:
             return
-        print("=" * 80)
-        print("Curriculum Temporal Sampler Initialized")
-        print("=" * 80)
+        self.logger.info("%s", "=" * 80)
+        self.logger.info("Curriculum Temporal Sampler Initialized")
+        self.logger.info("%s", "=" * 80)
         if not self.curriculum_schedule:
-            print("<empty curriculum schedule>")
-            print("=" * 80)
+            self.logger.info("<empty curriculum schedule>")
+            self.logger.info("%s", "=" * 80)
             return
 
         base_phase = self.curriculum_schedule[0]
@@ -141,9 +156,11 @@ class CurriculumTemporalSampler(Sampler):
 
         for epoch, min_f, max_f, bs in self.curriculum_schedule:
             global_batch = bs * world_size
-            print(f"Epoch {epoch:6d}+: frames=[{min_f:2d}, {max_f:2d}], "
-                  f"batch_size={bs}/gpu ({global_batch} global)")
-        print("=" * 80)
+            self.logger.info(
+                "Epoch %6d+: frames=[%2d, %2d], batch_size=%d/gpu (%d global)",
+                epoch, min_f, max_f, bs, global_batch
+            )
+        self.logger.info("%s", "=" * 80)
     
     def _get_current_phase(self):
         """Get current curriculum phase based on training epoch."""
@@ -166,9 +183,9 @@ class CurriculumTemporalSampler(Sampler):
         
         bucket_indices = {i: [] for i in range(len(buckets))}
         
-        # Only print assignment details on rank 0 to avoid duplicate logs in DDP
+        # Only log assignment details on rank 0 to avoid duplicate logs in DDP
         if getattr(self, 'rank', 0) == 0:
-            print(f"\nAssigning samples to phase [{min_frames}-{max_frames} frames]...")
+            self.logger.info("Assigning samples to phase [%d-%d frames]...", min_frames, max_frames)
         
         # For curriculum learning, all videos are eligible since we control sampling range
         # Bucket based on the number of frames we'll sample (random within phase range)
@@ -178,12 +195,12 @@ class CurriculumTemporalSampler(Sampler):
             bucket_idx = idx % len(buckets)
             bucket_indices[bucket_idx].append(idx)
         
-        # Print statistics
+        # Log statistics
         total = sum(len(indices) for indices in bucket_indices.values())
-        print(f"  Total samples in phase: {total}")
+        self.logger.info("  Total samples in phase: %d", total)
         for bucket_idx, indices in bucket_indices.items():
             bucket_min, bucket_max = buckets[bucket_idx]
-            print(f"    Bucket [{bucket_min:2d}-{bucket_max:2d}]: {len(indices):6d} samples")
+            self.logger.info("    Bucket [%2d-%2d]: %6d samples", bucket_min, bucket_max, len(indices))
         
         phase['bucket_indices'] = bucket_indices
         return bucket_indices
@@ -258,7 +275,6 @@ class CurriculumTemporalSampler(Sampler):
         phase = self._get_current_phase()
         bucket_indices = self._assign_to_buckets(phase)
         batch_size = self.get_current_batch_size()
-        
         total_batches = 0
         for indices in bucket_indices.values():
             # Account for distributed training
@@ -267,7 +283,7 @@ class CurriculumTemporalSampler(Sampler):
                 total_batches += indices_per_gpu // batch_size
             else:
                 total_batches += (indices_per_gpu + batch_size - 1) // batch_size
-        
+
         return total_batches
 
 
