@@ -1,0 +1,16 @@
+accelerate
+av
+diffusers
+# flash_attn
+imageio
+matplotlib
+git+https://github.com/KellerJordan/Muon
+numpy
+scikit-learn
+timm
+torch
+torchcodec
+torchdiffeq
+torchvision
+tqdm
+wandb
