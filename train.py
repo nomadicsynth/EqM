@@ -1001,9 +1001,9 @@ def main(args):
                                                    dynamic_ncols=True):
                             # Initialize for gradient descent sampling
                             if getattr(args, 'video', False):
-                                zs_batch = torch.randn(local_batch_size, 4, args.num_frames, latent_size, latent_size, device=device)
+                                zs_batch = torch.randn(local_batch_size, 4, args.num_frames, latent_size, latent_size, device=device) * 0.18215
                             else:
-                                zs_batch = torch.randn(local_batch_size, 4, latent_size, latent_size, device=device)
+                                zs_batch = torch.randn(local_batch_size, 4, latent_size, latent_size, device=device) * 0.18215
                             
                             ys_batch = torch.randint(args.num_classes, size=(local_batch_size,), device=device)
                             

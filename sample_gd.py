@@ -188,12 +188,12 @@ def main(args):
     # Labels to condition the model with (feel free to change):
     ys = torch.randint(args.num_classes, size=(local_batch_size,), device=device)
     use_cfg = args.cfg_scale > 1.0
-    # Create sampling noise:
+    # Create sampling noise (scale to match VAE latent scale used during training)
     n = ys.size(0)
     if getattr(args, 'video', False):
-        zs = torch.randn(n, 4, args.num_frames, latent_size, latent_size, device=device)
+        zs = torch.randn(n, 4, args.num_frames, latent_size, latent_size, device=device) * 0.18215
     else:
-        zs = torch.randn(n, 4, latent_size, latent_size, device=device)
+        zs = torch.randn(n, 4, latent_size, latent_size, device=device) * 0.18215
 
     # Setup classifier-free guidance:
     if use_cfg:
@@ -265,9 +265,9 @@ def main(args):
     for i in pbar:
         with torch.no_grad():
             if getattr(args, 'video', False):
-                z = torch.randn(n, 4, args.num_frames, latent_size, latent_size, device=device)
+                z = torch.randn(n, 4, args.num_frames, latent_size, latent_size, device=device) * 0.18215
             else:
-                z = torch.randn(n, 4, latent_size, latent_size, device=device)
+                z = torch.randn(n, 4, latent_size, latent_size, device=device) * 0.18215
             y = torch.randint(0, args.num_classes, (n,), device=device)
             t = torch.ones((n,)).to(z).to(device)
             if use_cfg:

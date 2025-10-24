@@ -146,6 +146,13 @@ class RoPE3D(nn.Module):
         dim_h = dim // 3
         dim_w = dim - dim_t - dim_h
         
+        # Normalize time_scale to a tensor of shape (batch_size,)
+        if not torch.is_tensor(time_scale):
+            time_scale = torch.full((batch_size,), float(time_scale), device=x.device, dtype=torch.float32)
+        else:
+            if time_scale.device != x.device:
+                time_scale = time_scale.to(x.device)
+
         # Split x into batches and process each with its own time_scale
         x_t_list, x_h_list, x_w_list = [], [], []
         
@@ -628,13 +635,25 @@ class EqM(nn.Module):
             # Otherwise fall back to training grid_size
             if grid_size is None:
                 grid_size = self.grid_size
-            # Compute dynamic positional embedding with time scaling using patch-center times
+            # Determine temporal patch size (pt)
             if isinstance(self.patch_size, int):
                 pt = self.patch_size
             else:
                 pt = self.patch_size[0]
-            pos_embed = get_3d_sincos_pos_embed(self.hidden_size, grid_size, time_scale=time_scale, patch_temporal=pt)
-            return torch.from_numpy(pos_embed).float().unsqueeze(0).to(self.pos_embed_default.device)
+
+            # time_scale may be a scalar or a tensor (per-sample). We support both.
+            device = self.x_embedder.proj.weight.device
+            if isinstance(time_scale, torch.Tensor):
+                ts = time_scale.detach().cpu().numpy().reshape(-1)
+                pos_list = []
+                for t in ts:
+                    pos_np = get_3d_sincos_pos_embed(self.hidden_size, grid_size, time_scale=float(t), patch_temporal=pt)
+                    pos_list.append(pos_np)
+                pos_stack = np.stack(pos_list, axis=0)  # (N, num_patches, D)
+                return torch.from_numpy(pos_stack).float().to(device)
+            else:
+                pos_embed = get_3d_sincos_pos_embed(self.hidden_size, grid_size, time_scale=float(time_scale), patch_temporal=pt)
+                return torch.from_numpy(pos_embed).float().unsqueeze(0).to(device)
         else:
             return self.pos_embed
 
@@ -703,12 +722,22 @@ class EqM(nn.Module):
         else:
             attn_mask = None
         
+        # Sanity-check: ensure model patch_size matches patch embedder
+        if self.is3d:
+            embed_patch = self.x_embedder.patch_size
+            if isinstance(self.patch_size, int):
+                expected_pt = self.patch_size
+                assert embed_patch[0] == expected_pt, f"PatchEmbed temporal size {embed_patch[0]} != model.patch_size {expected_pt}"
+            else:
+                assert tuple(embed_patch) == tuple(self.patch_size), f"PatchEmbed patch_size {embed_patch} != model.patch_size {self.patch_size}"
+
         # Transformer blocks
         for block in self.blocks:
             if self.use_rope:
-                x = block(x, c, grid_size=grid_size, time_scale=time_scale, attn_mask=attn_mask)
+                # Pass the model's patch_size through to blocks so RoPE can compute correct temporal anchoring
+                x = block(x, c, grid_size=grid_size, time_scale=time_scale, attn_mask=attn_mask, patch_size=self.x_embedder.patch_size)
             else:
-                x = block(x, c, attn_mask=attn_mask)
+                x = block(x, c, attn_mask=attn_mask, patch_size=self.x_embedder.patch_size)
             act.append(x)
             
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
