@@ -98,6 +98,44 @@ def main(args):
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     local_batch_size = int(args.global_batch_size // dist.get_world_size())
     
+    # If a checkpoint is provided, attempt to read saved args (num_classes, uncond) to match model construction
+    if args.ckpt is not None:
+        try:
+            ck_meta = find_model(args.ckpt)
+            if isinstance(ck_meta, dict):
+                # If checkpoint saved args, use them to override CLI where appropriate
+                if 'args' in ck_meta:
+                    ck_args = ck_meta['args']
+                    try:
+                        if hasattr(ck_args, 'uncond'):
+                            args.uncond = bool(getattr(ck_args, 'uncond'))
+                            print(f"Overriding --uncond from checkpoint: {args.uncond}")
+                        if hasattr(ck_args, 'num_classes'):
+                            args.num_classes = int(getattr(ck_args, 'num_classes'))
+                            print(f"Overriding --num-classes from checkpoint: {args.num_classes}")
+                    except Exception:
+                        pass
+                else:
+                    # Fallback: try to infer class count from saved embedding table
+                    model_state = ck_meta.get('model', None)
+                    if isinstance(model_state, dict):
+                        for k, v in model_state.items():
+                            if k.endswith('y_embedder.embedding_table.weight'):
+                                M = v.shape[0]
+                                # If we have uncond True (from checkpoint args or CLI), assume embedding included a CFG token
+                                use_uncond = getattr(ck_meta.get('args', {}), 'uncond', args.uncond) if hasattr(ck_meta.get('args', {}), 'uncond') else args.uncond
+                                try:
+                                    if use_uncond and M > 1:
+                                        args.num_classes = int(M - 1)
+                                    else:
+                                        args.num_classes = int(M)
+                                    print(f"Inferred --num-classes={args.num_classes} from checkpoint embedding size={M} (use_uncond={use_uncond})")
+                                except Exception:
+                                    pass
+                                break
+        except Exception as e:
+            print(f"Warning: failed to inspect checkpoint metadata: {e}")
+
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
