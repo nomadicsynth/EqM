@@ -821,6 +821,9 @@ def main(args):
     prev_phase_key = None
     phase_logged_batches = 0
 
+    # Track the most recently computed gradient norm (for logging / wandb)
+    last_grad_norm = None
+
     for epoch in tqdm(range(args.epochs), desc="Training", disable=rank != 0, unit="epoch", dynamic_ncols=True):
         if train_steps >= max_train_steps or interrupted:
             break
@@ -951,10 +954,23 @@ def main(args):
 
             # Only step optimizer after accumulating enough gradients
             if accumulation_counter >= args.gradient_accumulation_steps:
-                # --- Gradient Clipping ---
-                if args.grad_clip > 0:
+                # --- Gradient Clipping & Norm Logging ---
+                # If AMP is enabled and grads are scaled, unscale before measuring/clipping.
+                if scaler.is_enabled():
                     scaler.unscale_(opt)
+
+                # Compute global gradient L2 norm (over all parameters)
+                total_norm_sq = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm_sq += float(param_norm.item()) ** 2
+                last_grad_norm = float(total_norm_sq**0.5)
+
+                if args.grad_clip > 0:
+                    # Clip gradients (operates on unscaled grads if AMP)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad()
@@ -1249,18 +1265,21 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                current_lrs = [group['lr'] for group in opt.param_groups]
+                current_lrs = [group["lr"] for group in opt.param_groups]
+                grad_norm_display = last_grad_norm if last_grad_norm is not None else float("nan")
                 if args.use_muon and len(current_lrs) > 1:
-                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR_Muon: {current_lrs[0]:.6e}, LR_AdamW: {current_lrs[1]:.6e}")
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR_Muon: {current_lrs[0]:.6e}, LR_AdamW: {current_lrs[1]:.6e}, Grad Norm: {grad_norm_display:.4f}")
                 else:
-                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lrs[0]:.6e}")
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lrs[0]:.6e}, Grad Norm: {grad_norm_display:.4f}")
 
                 # Collect all wandb metrics to log at once
                 if args.wandb:
                     import wandb
+
                     log_dict = {
                         "train loss": avg_loss,
-                        "train steps/sec": steps_per_sec
+                        "train steps/sec": steps_per_sec,
+                        "grad_norm": None if last_grad_norm is None else last_grad_norm,
                     }
                     # Add learning rates with descriptive labels
                     if args.use_muon and len(current_lrs) > 1:
