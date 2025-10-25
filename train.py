@@ -502,6 +502,7 @@ def main(args):
     )  # default: velocity; 
     transport_sampler = Sampler(transport)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae_latent_scale = 0.18215  # Scaling factor for latent space
     logger.info(f"EqM Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Load InceptionV3 for FID computation if enabled
@@ -912,7 +913,7 @@ def main(args):
                         logger.debug(f" batch={batch_idx}: raw_frames_min={int(raw_frames.min())}, raw_frames_max={max_raw}, padded_to={padded_to}, pt={pt}, patches_min={int(patch_counts.min())}, patches_max={int(patch_counts.max())}, avg_tokens/sample={avg_tokens:.1f}, tokens/step~{tokens_per_step:.1f}")
                         phase_logged_batches += 1
                 with torch.no_grad():
-                    lat = vae.encode(x_frames).latent_dist.sample().mul_(0.18215)
+                    lat = vae.encode(x_frames).latent_dist.sample().mul_(vae_latent_scale)
                 # reshape latents back to (N, C_latent, T, latent_H, latent_W)
                 C_lat = lat.shape[1]
                 lat = lat.reshape(N, T, C_lat, lat.shape[-2], lat.shape[-1]).permute(0, 2, 1, 3, 4)
@@ -925,7 +926,7 @@ def main(args):
                 time_scale = torch.ones(x.shape[0], device=device, dtype=torch.float32)
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
-                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                    x = vae.encode(x).latent_dist.sample().mul_(vae_latent_scale)
 
             # Pass number of real RAW FRAMES to the model (used for masking). The
             # model's masking helper (`create_temporal_mask`) expects raw frame
@@ -1070,15 +1071,13 @@ def main(args):
                         target_videos = 4
                         target_frames = 4
 
-                        for fid_batch_idx in _tqdm(range(num_fid_batches),
-                                                   desc="FID batches" if rank == 0 else None,
-                                                   disable=(rank != 0),
-                                                   dynamic_ncols=True):
+                        for fid_batch_idx in _tqdm(range(num_fid_batches), desc="FID batches" if rank == 0 else None,
+                                                   disable=(rank != 0), unit="batch", dynamic_ncols=True, leave=False):
                             # Initialize for gradient descent sampling
                             if getattr(args, 'video', False):
-                                zs_batch = torch.randn(local_batch_size, 4, args.num_frames, latent_size, latent_size, device=device) * 0.18215
+                                zs_batch = torch.randn(local_batch_size, 4, args.num_frames, latent_size, latent_size, device=device) * vae_latent_scale
                             else:
-                                zs_batch = torch.randn(local_batch_size, 4, latent_size, latent_size, device=device) * 0.18215
+                                zs_batch = torch.randn(local_batch_size, 4, latent_size, latent_size, device=device) * vae_latent_scale
 
                             ys_batch = torch.randint(args.num_classes, size=(local_batch_size,), device=device)
 
@@ -1138,7 +1137,7 @@ def main(args):
                                 # For video: decode all frames and prepare flattened labeled images
                                 N, C, T, H, W = samples.shape
                                 samples_frames = samples.permute(0, 2, 1, 3, 4).reshape(N * T, C, H, W)
-                                decoded_frames = vae.decode(samples_frames / 0.18215).sample
+                                decoded_frames = vae.decode(samples_frames / vae_latent_scale).sample
 
                                 # decoded_frames: (N*T, 3, H, W)
                                 # Reshape to (N, T, 3, H, W) so we can build labels per-frame
@@ -1156,7 +1155,7 @@ def main(args):
                                 except Exception:
                                     first_batch_video_duration = None
                             else:
-                                samples_to_log = vae.decode(samples / 0.18215).sample
+                                samples_to_log = vae.decode(samples / vae_latent_scale).sample
 
                             # Collect the first video from this fid batch (if video mode)
                             if getattr(args, 'video', False):
