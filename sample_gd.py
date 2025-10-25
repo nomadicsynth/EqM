@@ -251,7 +251,8 @@ def main(args):
         if getattr(args, 'video', False):
             if args.video_duration is not None and args.target_fps is not None:
                 # User specified both duration and playback fps
-                time_scale = args.video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
+                # Slots semantics: time_scale = total_duration / num_frames
+                time_scale = args.video_duration / args.num_frames if args.num_frames > 0 else 0.0
                 print(f"\nVideo Generation Settings:")
                 print(f"  Frames to generate: {args.num_frames}")
                 print(f"  Content duration: {args.video_duration:.3f}s")
@@ -261,8 +262,8 @@ def main(args):
                 print(f"  Speed: {(args.num_frames / args.target_fps) / args.video_duration:.2f}x {'faster' if (args.num_frames / args.target_fps) < args.video_duration else 'slower'} than real-time")
             elif args.video_duration is not None:
                 # User specified duration only - calculate matched playback fps
-                time_scale = args.video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
-                args.target_fps = int(round((args.num_frames - 1) / args.video_duration))
+                time_scale = args.video_duration / args.num_frames if args.num_frames > 0 else 0.0
+                args.target_fps = int(round((args.num_frames) / args.video_duration)) if args.video_duration > 0 else None
                 print(f"\nVideo Generation Settings:")
                 print(f"  Frames to generate: {args.num_frames}")
                 print(f"  Content duration: {args.video_duration:.3f}s")
@@ -272,18 +273,18 @@ def main(args):
             else:
                 # Backwards compatibility: derive from target_fps
                 time_scale = 1.0 / args.target_fps
-                duration = time_scale * (args.num_frames - 1) if args.num_frames > 1 else 0.0
+                duration = time_scale * (args.num_frames) if args.num_frames > 0 else 0.0
                 print(f"\nVideo Generation Settings:")
                 print(f"  Frames to generate: {args.num_frames}")
                 print(f"  Time scale: {time_scale:.4f} s/frame (from target-fps)")
                 print(f"  Content duration: {duration:.3f}s")
                 print(f"  Playback FPS: {args.target_fps}")
                 print(f"  Playback duration: {duration:.3f}s")
-    # Compute time_scale for video generation
+    # Compute time_scale for video generation (slots semantics: seconds per frame = duration / num_frames)
     if getattr(args, 'video', False):
         if args.video_duration is not None:
-            # Use explicit duration: time_scale = total_duration / (num_frames - 1)
-            time_scale = args.video_duration / (args.num_frames - 1) if args.num_frames > 1 else 0.0
+            # Use explicit duration: time_scale = total_duration / num_frames
+            time_scale = args.video_duration / args.num_frames if args.num_frames > 0 else 0.0
         else:
             # Derive from target FPS: time_scale = 1 / fps
             time_scale = 1.0 / args.target_fps
@@ -407,8 +408,8 @@ if __name__ == "__main__":
     parser.add_argument("--video", action="store_true", help="Enable video sampling mode")
     parser.add_argument("--num-frames", type=int, default=16, help="Number of frames per video clip")
     parser.add_argument("--video-duration", type=float, default=1.0, 
-                        help="Total duration spanned by the generated frames (in seconds). "
-                             "E.g., --num-frames 4 --video-duration 3.0 means 4 frames spanning 3 seconds (1 sec between frames).")
+                    help="Total playback duration in seconds. Uses 'slots' semantics: time_scale = duration / num_frames. "
+                        "E.g., --num-frames 4 --video-duration 1.0 => 0.25s per frame.")
     parser.add_argument("--target-fps", type=int, default=None, 
                         help="Frame rate for saving the video file (affects playback speed only). "
                              "If not specified and video-duration is given, will be set to match content duration. "
@@ -430,27 +431,27 @@ if __name__ == "__main__":
             args.video_duration = None
         elif args.video_duration is not None and args.target_fps is None:
             # Duration specified, no fps - calculate matching fps for real-time playback
-            if args.num_frames <= 1:
-                raise ValueError("num_frames must be > 1 when using video_duration")
-            args.target_fps = max(1, int(round(args.num_frames / args.video_duration)))
+            if args.num_frames <= 0:
+                raise ValueError("num_frames must be > 0 when using video_duration")
+            args.target_fps = max(1, int(round(args.num_frames / args.video_duration))) if args.video_duration > 0 else None
             print(f"Calculated playback fps: {args.target_fps} (to match {args.video_duration}s content duration)")
-        
-        # Print configuration
-        time_scale = args.video_duration / (args.num_frames - 1) if args.video_duration is not None and args.num_frames > 1 else (1.0 / args.target_fps if args.target_fps else 0.04)
-        content_duration = args.video_duration if args.video_duration is not None else (time_scale * (args.num_frames - 1))
-        playback_duration = args.num_frames / args.target_fps if args.target_fps else content_duration
-        
-        print(f"\nVideo Generation Configuration:")
-        print(f"  Frames: {args.num_frames}")
-        print(f"  Content duration: {content_duration:.3f}s (what the model generates)")
-        print(f"  Time scale: {time_scale:.4f} s/frame (temporal spacing in model)")
-        print(f"  Playback FPS: {args.target_fps}")
-        print(f"  Playback duration: {playback_duration:.3f}s (how long the file plays)")
-        if abs(playback_duration - content_duration) > 0.01:
-            speed_factor = playback_duration / content_duration
-            print(f"  → Video will play at {1/speed_factor:.2f}x speed ({'slow-motion' if speed_factor > 1 else 'fast-forward'})")
-        else:
-            print(f"  → Video will play at real-time speed (matches content duration)")
-        print()
+            
+            # Print configuration
+            time_scale = args.video_duration / args.num_frames if args.video_duration is not None and args.num_frames > 0 else (1.0 / args.target_fps if args.target_fps else 0.04)
+            content_duration = args.video_duration if args.video_duration is not None else (time_scale * (args.num_frames))
+            playback_duration = args.num_frames / args.target_fps if args.target_fps else content_duration
+            
+            print(f"\nVideo Generation Configuration:")
+            print(f"  Frames: {args.num_frames}")
+            print(f"  Content duration: {content_duration:.3f}s (what the model generates)")
+            print(f"  Time scale: {time_scale:.4f} s/frame (temporal spacing in model)")
+            print(f"  Playback FPS: {args.target_fps}")
+            print(f"  Playback duration: {playback_duration:.3f}s (how long the file plays)")
+            if abs(playback_duration - content_duration) > 0.01:
+                speed_factor = playback_duration / content_duration
+                print(f"  → Video will play at {1/speed_factor:.2f}x speed ({'slow-motion' if speed_factor > 1 else 'fast-forward'})")
+            else:
+                print(f"  → Video will play at real-time speed (matches content duration)")
+            print()
     
     main(args)

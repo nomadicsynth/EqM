@@ -162,12 +162,12 @@ class RoPE3D(nn.Module):
         x_t_list, x_h_list, x_w_list = [], [], []
         
         for b in range(batch_size):
-            # Generate temporal positions as patch-center times in seconds.
+            # Generate temporal positions as patch times in seconds.
             # For token index i (0..t-1), the patch covers frames [i*pt .. i*pt+pt-1].
-            # The center frame index is i*pt + (pt-1)/2, so convert to seconds by
-            # multiplying by time_scale (seconds per frame).
+            # This implementation anchors tokens to the patch end: end_frame = i*pt + (pt-1).
+            # Treat time_scale as seconds per frame (slots semantics) and convert to seconds
+            # by multiplying end_frame_index * time_scale.
             pt = patch_temporal if isinstance(patch_temporal, int) else int(patch_temporal)
-            # Patch-end anchoring: token represents the last frame in the patch
             pos_t = (torch.arange(t, device=x.device, dtype=torch.float32) * pt + (pt - 1)) * time_scale[b]
             pos_h = torch.arange(h, device=x.device, dtype=torch.float32)
             pos_w = torch.arange(w, device=x.device, dtype=torch.float32)

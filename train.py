@@ -1351,7 +1351,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample-stepsize", type=float, default=0.003, help="Step size for gradient descent sampling")
     parser.add_argument("--sample-mu", type=float, default=0.35, help="Momentum parameter for NGD sampling")
     parser.add_argument("--sample-method", type=str, default="ngd", choices=["gd", "ngd", "ode"], help="Sampling method for visualization")
-    parser.add_argument("--sample-video-duration", type=float, default=1.0, help="Video duration for sampling (used to compute time_scale)")
+    parser.add_argument("--sample-video-duration", type=float, default=1.0, help="Video duration for sampling (slots semantics: time_scale = duration / num_frames)")
     parser.add_argument("--compute-fid", action="store_true", help="Compute frame-wise FID during sampling")
     parser.add_argument("--fid-num-samples", type=int, default=50, help="Number of videos/images to generate for FID computation")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
