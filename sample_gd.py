@@ -233,16 +233,18 @@ def main(args):
     else:
         zs = torch.randn(n, 4, latent_size, latent_size, device=device) * 0.18215
 
-    # Setup classifier-free guidance:
+    # Setup classifier-free guidance. Only duplicate the batch if it's not already doubled.
     if use_cfg:
-        zs = torch.cat([zs, zs], 0)
+        if zs.shape[0] == n:
+            zs = torch.cat([zs, zs], 0)
         y_null = torch.tensor([args.num_classes] * n, device=device)
-        ys = torch.cat([ys, y_null], 0)
+        if ys.shape[0] == n:
+            ys = torch.cat([ys, y_null], 0)
         sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
         model_fn = ema.forward_with_cfg
     else:
         sample_model_kwargs = dict(y=ys)
-        model_fn = ema.forward    
+        model_fn = ema.forward
 
     if rank == 0:
         os.makedirs(args.folder, exist_ok=True)
@@ -309,11 +311,15 @@ def main(args):
             y = torch.randint(0, args.num_classes, (n,), device=device)
             t = torch.ones((n,)).to(z).to(device)
             if use_cfg:
-                z = torch.cat([z, z], 0)
+                # Only double the per-iteration batch if it's still size `n`.
+                if z.shape[0] == n:
+                    z = torch.cat([z, z], 0)
                 y_null = torch.tensor([args.num_classes] * n, device=device)
-                y = torch.cat([y, y_null], 0)
+                if y.shape[0] == n:
+                    y = torch.cat([y, y_null], 0)
                 model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, time_scale=time_scale)
-                t = torch.cat([t, t], 0)
+                if t.shape[0] == n:
+                    t = torch.cat([t, t], 0)
             else:
                 model_kwargs = dict(y=y, time_scale=time_scale)
             xt = z
@@ -400,7 +406,7 @@ if __name__ == "__main__":
                         help="energy formulation")
     parser.add_argument("--video", action="store_true", help="Enable video sampling mode")
     parser.add_argument("--num-frames", type=int, default=16, help="Number of frames per video clip")
-    parser.add_argument("--video-duration", type=float, default=None, 
+    parser.add_argument("--video-duration", type=float, default=1.0, 
                         help="Total duration spanned by the generated frames (in seconds). "
                              "E.g., --num-frames 4 --video-duration 3.0 means 4 frames spanning 3 seconds (1 sec between frames).")
     parser.add_argument("--target-fps", type=int, default=None, 

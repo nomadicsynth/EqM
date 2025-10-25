@@ -1039,6 +1039,13 @@ def main(args):
                         num_fid_batches = (args.fid_num_samples + local_batch_size - 1) // local_batch_size if args.compute_fid else 1
                         
                         from tqdm import tqdm as _tqdm  # local alias to avoid shadowing outer tqdm usage
+                        # Collect the first video from the first few fid batches so we can
+                        # assemble a 4x4 logged grid (4 videos x 4 frames). We gather the
+                        # first video (index 0) from up to `target_videos` batches below.
+                        collected_videos = []
+                        target_videos = 4
+                        target_frames = 4
+
                         for fid_batch_idx in _tqdm(range(num_fid_batches),
                                                    desc="FID batches" if rank == 0 else None,
                                                    disable=(rank != 0),
@@ -1104,19 +1111,47 @@ def main(args):
                             
                             # Decode samples from latent space
                             if getattr(args, 'video', False):
-                                # For video: decode frames
+                                # For video: decode all frames and prepare flattened labeled images
                                 N, C, T, H, W = samples.shape
                                 samples_frames = samples.permute(0, 2, 1, 3, 4).reshape(N * T, C, H, W)
                                 decoded_frames = vae.decode(samples_frames / 0.18215).sample
-                                # Take middle frame from each video for visualization
-                                mid_frame_idx = T // 2
-                                samples_to_log = decoded_frames.reshape(N, T, 3, decoded_frames.shape[-2], decoded_frames.shape[-1])[:, mid_frame_idx]
+
+                                # decoded_frames: (N*T, 3, H, W)
+                                # Reshape to (N, T, 3, H, W) so we can build labels per-frame
+                                decoded_frames = decoded_frames.reshape(N, T, 3, decoded_frames.shape[-2], decoded_frames.shape[-1])
+
+                                # Flatten into order: video0 frames (0..T-1), video1 frames, ...
+                                samples_to_log = decoded_frames.reshape(N * T, 3, decoded_frames.shape[-2], decoded_frames.shape[-1])
+
+                                # Record metadata for the first batch so we can build labels later
+                                # We prefer to build labels in the helper (timestamps etc.)
+                                first_batch_video_T = T
+                                # Prefer explicit sample duration if available; fallback to None
+                                try:
+                                    first_batch_video_duration = args.sample_video_duration
+                                except Exception:
+                                    first_batch_video_duration = None
                             else:
                                 samples_to_log = vae.decode(samples / 0.18215).sample
                             
-                            # Store first batch for logging
-                            if fid_batch_idx == 0:
-                                first_batch_samples = samples_to_log.clone()
+                            # Collect the first video from this fid batch (if video mode)
+                            if getattr(args, 'video', False):
+                                # decoded_frames: (N, T, 3, H, W)
+                                try:
+                                    # take as many videos from this batch as needed (in-order)
+                                    need = target_videos - len(collected_videos)
+                                    if need > 0:
+                                        # clamp to available videos in this batch
+                                        take = min(need, decoded_frames.shape[0])
+                                        for vi in range(take):
+                                            collected_videos.append(decoded_frames[vi].cpu().clone())
+                                except Exception:
+                                    # ignore collection failures
+                                    pass
+                            else:
+                                # For images, keep the first fid batch for logging as before
+                                if fid_batch_idx == 0:
+                                    first_batch_samples = samples_to_log.clone()
                             
                             # For FID: extract features immediately to save VRAM
                             if args.compute_fid:
@@ -1131,6 +1166,34 @@ def main(args):
                                 del samples_frames, decoded_frames
                             torch.cuda.empty_cache()
                         
+                        # After collecting videos from fid batches, assemble the first_batch_samples
+                        # as the first video from the first `target_videos` batches (one row per video,
+                        # `target_frames` columns). If needed, pad temporally or repeat videos to reach
+                        # the target shape.
+                        if getattr(args, 'video', False) and len(collected_videos) > 0:
+                            # Ensure we have at least target_videos by repeating collected videos
+                            while len(collected_videos) < target_videos:
+                                collected_videos.extend(collected_videos[: (target_videos - len(collected_videos))])
+
+                            # Prepare selected videos: ensure each has exactly target_frames frames
+                            sel_list = []
+                            for vid in collected_videos[:target_videos]:
+                                # vid shape: (T_vid, 3, H, W)
+                                T_vid = vid.shape[0]
+                                if T_vid < target_frames:
+                                    last = vid[-1:].repeat(target_frames - T_vid, 1, 1, 1)
+                                    vid_padded = torch.cat([vid, last], dim=0)
+                                else:
+                                    vid_padded = vid[:target_frames]
+                                # now vid_padded: (target_frames, 3, H, W)
+                                sel_list.append(vid_padded.unsqueeze(0))
+
+                            sel = torch.cat(sel_list, dim=0)  # (target_videos, target_frames, 3, H, W)
+                            # Flatten to (target_videos * target_frames, 3, H, W)
+                            first_batch_samples = sel.reshape(target_videos * target_frames, sel.shape[2], sel.shape[3], sel.shape[4]).clone()
+                            first_batch_video_T = target_frames
+                            first_batch_video_duration = getattr(args, 'sample_video_duration', None)
+
                         # Compute FID if enabled
                         fid_score = None
                         if args.compute_fid and real_features_collected:
@@ -1199,7 +1262,18 @@ def main(args):
                         log_dict["learning rate"] = current_lrs[0]
                     # Add samples and FID if they were generated at this step
                     if 'first_batch_samples' in locals():
-                        sample_grid = wandb_utils.array2grid(first_batch_samples)
+                        # If video sampling produced per-frame labels/nrow, pass them through
+                        if 'first_batch_video_T' in locals():
+                            # Use helper to build grid and labels (one row per video, T columns)
+                            duration = first_batch_video_duration if 'first_batch_video_duration' in locals() else None
+                            sample_grid = wandb_utils.make_video_grid(first_batch_samples, n_frames=first_batch_video_T, duration=duration)
+                            # clear helper metadata
+                            del first_batch_video_T
+                            if 'first_batch_video_duration' in locals():
+                                del first_batch_video_duration
+                        else:
+                            sample_grid = wandb_utils.array2grid(first_batch_samples)
+
                         log_dict["samples"] = wandb.Image(sample_grid)
                         del first_batch_samples  # Clear for next time
                     if 'fid_score' in locals() and fid_score is not None:
@@ -1277,7 +1351,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample-stepsize", type=float, default=0.003, help="Step size for gradient descent sampling")
     parser.add_argument("--sample-mu", type=float, default=0.35, help="Momentum parameter for NGD sampling")
     parser.add_argument("--sample-method", type=str, default="ngd", choices=["gd", "ngd", "ode"], help="Sampling method for visualization")
-    parser.add_argument("--sample-video-duration", type=float, default=2.0, help="Video duration for sampling (used to compute time_scale)")
+    parser.add_argument("--sample-video-duration", type=float, default=1.0, help="Video duration for sampling (used to compute time_scale)")
     parser.add_argument("--compute-fid", action="store_true", help="Compute frame-wise FID during sampling")
     parser.add_argument("--fid-num-samples", type=int, default=50, help="Number of videos/images to generate for FID computation")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")

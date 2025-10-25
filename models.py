@@ -775,16 +775,25 @@ class EqM(nn.Module):
         num_real_frames: (N,) tensor of real (non-padded) frame counts for masking
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y, time_scale=time_scale, return_act=return_act, get_energy=get_energy, train=train, num_real_frames=num_real_frames)
+
+        # Original approach: duplicate half the batch internally.
+        # half = x[: len(x) // 2]
+        # combined = torch.cat([half, half], dim=0)
+        # model_out = self.forward(combined, t, y, time_scale=time_scale, return_act=return_act, get_energy=get_energy, train=train, num_real_frames=num_real_frames)
+
+        # Expect the caller to already provide a doubled batch [cond; uncond].
+        # Call the base forward directly on the provided batch.
+        model_out = self.forward(x, t, y, time_scale=time_scale, return_act=return_act, get_energy=get_energy, train=train, num_real_frames=num_real_frames)
+
         if get_energy:
-            x, E = model_out
-            model_out=x
+            x_out, E = model_out
+            model_out = x_out
+
         if return_act:
             act = model_out[1]
             model_out = model_out[0]
-            eps, rest = model_out[:, :3], model_out[:, 3:]
+            # Apply CFG to the model's latent channels (use self.in_channels instead of hardcoded 3)
+            eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
             cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
             half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
             eps = torch.cat([half_eps, half_eps], dim=0)
@@ -792,8 +801,8 @@ class EqM(nn.Module):
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
+        eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        # eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
