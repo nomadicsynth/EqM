@@ -475,10 +475,10 @@ class SiTBlock(nn.Module):
 
     def forward(self, x, c, grid_size=None, time_scale=None, attn_mask=None, patch_size=1):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        
+
         # Apply RoPE before attention if enabled
         x_normed = modulate(self.norm1(x), shift_msa, scale_msa)
-        
+
         # Apply attention with optional masking
         # If using RoPE we need to apply rotary to q/k after projection. We also need masking support.
         # Use manual attention path whenever RoPE is enabled so we can inject q/k rotation.
@@ -498,11 +498,11 @@ class SiTBlock(nn.Module):
                 attn_output = self._masked_attention(x_normed, attn_mask)
             else:
                 attn_output = self.attn(x_normed)
-        
+
         x = x + gate_msa.unsqueeze(1) * attn_output
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
-    
+
     def _masked_attention(self, x, attn_mask, grid_size=None, time_scale=None, patch_temporal=1):
         """
         Manual attention computation with masking support.
@@ -523,7 +523,7 @@ class SiTBlock(nn.Module):
 
         # Compute attention scores
         attn = (q @ k.transpose(-2, -1)) * self.attn.scale  # (B, num_heads, N, N)
-        
+
         # Apply mask: set padding positions to -inf so they get 0 attention after softmax
         if attn_mask is not None:
             # attn_mask is (B, N) boolean where True=valid. Build a 4D mask for
@@ -533,13 +533,20 @@ class SiTBlock(nn.Module):
             query_mask = attn_mask.unsqueeze(1).unsqueeze(3) # (B,1,N,1)
             combined = key_mask & query_mask                 # (B,1,N,N)
             attn = attn.masked_fill(~combined, float('-inf'))
-        
+
         attn = attn.softmax(dim=-1)
+        # Prevent NaNs when an entire row was masked (softmax of all -inf). Replace NaNs/inf with zeros.
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
         attn = self.attn.attn_drop(attn)
-        
+
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.attn.proj(x)
         x = self.attn.proj_drop(x)
+
+        # Zero-out outputs corresponding to padding tokens so downstream ops don't get garbage.
+        if attn_mask is not None:
+            x = x.masked_fill(~attn_mask.unsqueeze(-1), 0.0)
+
         return x
 
 
