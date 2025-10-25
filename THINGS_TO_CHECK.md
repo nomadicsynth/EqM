@@ -1,5 +1,6 @@
 # Things to Check
 
+- [ ] revert to find version from training run "062-EqM-S-4-Linear-velocity-None", which looked like it was working properly, and see what's been broken since then.
 - [ ] cfg free guidance. it was messed-with during debugging. make sure it works like the reference implementation from upstream.
 - [ ] check if gradient clipping is working. gradients are huge, even with it turned on. also learn whether gradients need to be scaled based on batch size.
 - [ ] the samples from the currently training checkpoint look like they're made up of tiny images tiled together. is this an attention bug, or just a symptom of insufficient training?
