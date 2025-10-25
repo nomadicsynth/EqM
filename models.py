@@ -76,7 +76,7 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
-def create_temporal_mask(num_real_frames, grid_size, device):
+def create_temporal_mask(num_real_frames, grid_size, device, patch_temporal=1):
     """
     Create attention mask for padded video sequences.
     
@@ -99,10 +99,15 @@ def create_temporal_mask(num_real_frames, grid_size, device):
     mask = torch.zeros(B, num_patches, dtype=torch.bool, device=device)
     
     for b in range(B):
-        real_t = num_real_frames[b].item()
-        # All spatial patches are valid, but only first real_t temporal patches
-        # Patches are ordered as: (t=0, h, w), (t=1, h, w), ..., (t=T-1, h, w)
-        valid_patches = real_t * h * w
+        real_frames = num_real_frames[b].item()
+        # Convert real frame count into number of valid temporal patches.
+        # If patches are made of `patch_temporal` consecutive frames, the number of
+        # valid temporal patches is ceil(real_frames / patch_temporal).
+        valid_temporal = int(math.ceil(float(real_frames) / float(patch_temporal))) if patch_temporal > 0 else t
+        # Clip to available temporal patches
+        valid_temporal = min(valid_temporal, t)
+        # All spatial patches for those temporal indices are valid
+        valid_patches = valid_temporal * h * w
         mask[b, :valid_patches] = True
     
     return mask
@@ -229,6 +234,77 @@ class RoPE3D(nn.Module):
         
         # Reshape back
         return x_rotated.view(x.shape[0], x.shape[1], dim)
+
+    def apply_to_qk(self, q, k, grid_size, time_scale, patch_temporal=1):
+        """
+        Apply 3D RoPE to query/key tensors after they have been projected into heads.
+
+        Args:
+            q, k: tensors of shape (B, num_heads, N, head_dim)
+            grid_size: (t,h,w)
+            time_scale: scalar or tensor of shape (B,)
+            patch_temporal: temporal patch size
+
+        Returns:
+            (q_rot, k_rot) with the same shapes
+        """
+        B, NH, N, Hdim = q.shape
+
+        # flatten batch and heads so we can reuse existing 1D rotor on last-dim chunks
+        q_flat = q.reshape(B * NH, N, Hdim)
+        k_flat = k.reshape(B * NH, N, Hdim)
+
+        # time_scale per merged batch (repeat per head)
+        if not torch.is_tensor(time_scale):
+            ts = torch.full((B,), float(time_scale), device=q.device, dtype=torch.float32)
+        else:
+            ts = time_scale.to(q.device).float()
+        ts_flat = ts.unsqueeze(1).repeat(1, NH).view(-1)
+
+        # split dims into three parts for t,h,w
+        dim_t = Hdim // 3
+        dim_h = Hdim // 3
+        dim_w = Hdim - dim_t - dim_h
+
+        # Prepare output holders
+        q_out_chunks = []
+        k_out_chunks = []
+
+        # We'll process each merged-batch element individually to allow different time_scale
+        for i in range(B * NH):
+            t_i = ts_flat[i]
+            pt = patch_temporal if isinstance(patch_temporal, int) else int(patch_temporal)
+            # positions for this merged batch element
+            pos_t = (torch.arange(grid_size[0], device=q.device, dtype=torch.float32) * pt + (pt - 1)) * t_i
+            pos_h = torch.arange(grid_size[1], device=q.device, dtype=torch.float32)
+            pos_w = torch.arange(grid_size[2], device=q.device, dtype=torch.float32)
+            grid_t, grid_h, grid_w = torch.meshgrid(pos_t, pos_h, pos_w, indexing='ij')
+            positions = torch.stack([grid_t.flatten(), grid_h.flatten(), grid_w.flatten()], dim=1)
+
+            q_b = q_flat[i:i+1]  # (1, N, Hdim)
+            k_b = k_flat[i:i+1]
+
+            # split channel chunks
+            q_t, q_h, q_w = q_b.split([dim_t, dim_h, dim_w], dim=-1)
+            k_t, k_h, k_w = k_b.split([dim_t, dim_h, dim_w], dim=-1)
+
+            q_t = self.apply_rotary_emb_1d(q_t, positions[:, 0], dim_t)
+            q_h = self.apply_rotary_emb_1d(q_h, positions[:, 1], dim_h)
+            q_w = self.apply_rotary_emb_1d(q_w, positions[:, 2], dim_w)
+
+            k_t = self.apply_rotary_emb_1d(k_t, positions[:, 0], dim_t)
+            k_h = self.apply_rotary_emb_1d(k_h, positions[:, 1], dim_h)
+            k_w = self.apply_rotary_emb_1d(k_w, positions[:, 2], dim_w)
+
+            q_rot = torch.cat([q_t, q_h, q_w], dim=-1)
+            k_rot = torch.cat([k_t, k_h, k_w], dim=-1)
+
+            q_out_chunks.append(q_rot)
+            k_out_chunks.append(k_rot)
+
+        q_out = torch.cat(q_out_chunks, dim=0).reshape(B, NH, N, Hdim)
+        k_out = torch.cat(k_out_chunks, dim=0).reshape(B, NH, N, Hdim)
+        return q_out, k_out
 
 
 #################################################################################
@@ -402,32 +478,32 @@ class SiTBlock(nn.Module):
         
         # Apply RoPE before attention if enabled
         x_normed = modulate(self.norm1(x), shift_msa, scale_msa)
-        if self.use_rope and grid_size is not None:
+        
+        # Apply attention with optional masking
+        # If using RoPE we need to apply rotary to q/k after projection. We also need masking support.
+        # Use manual attention path whenever RoPE is enabled so we can inject q/k rotation.
+        if self.use_rope:
             # Determine temporal patch size (pt) from patch_size argument
             if isinstance(patch_size, int):
                 pt = patch_size
             else:
-                # patch_size may be tuple (pt, ph, pw)
                 try:
                     pt = patch_size[0]
                 except Exception:
                     pt = 1
-            x_normed = self.rope(x_normed, grid_size, time_scale, patch_temporal=pt)
-        
-        # Apply attention with optional masking
-        if attn_mask is not None:
-            # timm's Attention doesn't support attn_mask directly, so we'll use a workaround
-            # Store original attention and apply mask via hook or manual implementation
-            # For now, use manual scaled dot-product attention
-            attn_output = self._masked_attention(x_normed, attn_mask)
+            attn_output = self._masked_attention(x_normed, attn_mask, grid_size=grid_size, time_scale=time_scale, patch_temporal=pt)
         else:
-            attn_output = self.attn(x_normed)
+            if attn_mask is not None:
+                # timm's Attention doesn't support attn_mask directly, so we'll use manual attention
+                attn_output = self._masked_attention(x_normed, attn_mask)
+            else:
+                attn_output = self.attn(x_normed)
         
         x = x + gate_msa.unsqueeze(1) * attn_output
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
     
-    def _masked_attention(self, x, attn_mask):
+    def _masked_attention(self, x, attn_mask, grid_size=None, time_scale=None, patch_temporal=1):
         """
         Manual attention computation with masking support.
         attn_mask: (B, N) boolean mask where True = valid position, False = padding
@@ -436,15 +512,27 @@ class SiTBlock(nn.Module):
         # Use the existing attention's qkv projection
         qkv = self.attn.qkv(x).reshape(B, N, 3, self.attn.num_heads, C // self.attn.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # (B, num_heads, N, head_dim)
-        
+
+        # If RoPE is enabled and grid_size provided, apply rotation to q/k now (after projection)
+        if self.use_rope and grid_size is not None and hasattr(self, 'rope'):
+            try:
+                q, k = self.rope.apply_to_qk(q, k, grid_size, time_scale, patch_temporal=patch_temporal)
+            except Exception:
+                # Fallback: leave q,k unchanged on failure
+                pass
+
         # Compute attention scores
         attn = (q @ k.transpose(-2, -1)) * self.attn.scale  # (B, num_heads, N, N)
         
         # Apply mask: set padding positions to -inf so they get 0 attention after softmax
         if attn_mask is not None:
-            # attn_mask is (B, N), expand to (B, 1, 1, N) for broadcasting
-            mask = attn_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N)
-            attn = attn.masked_fill(~mask, float('-inf'))
+            # attn_mask is (B, N) boolean where True=valid. Build a 4D mask for
+            # queries and keys so that any pair involving a padding token is masked.
+            # key_mask: (B, 1, 1, N), query_mask: (B, 1, N, 1)
+            key_mask = attn_mask.unsqueeze(1).unsqueeze(2)   # (B,1,1,N)
+            query_mask = attn_mask.unsqueeze(1).unsqueeze(3) # (B,1,N,1)
+            combined = key_mask & query_mask                 # (B,1,N,N)
+            attn = attn.masked_fill(~combined, float('-inf'))
         
         attn = attn.softmax(dim=-1)
         attn = self.attn.attn_drop(attn)
