@@ -256,11 +256,11 @@ def main(args):
     import warnings
     warnings.filterwarnings('ignore', message='.*barrier.*using the device under current context.*')
     dist.init_process_group("nccl")
-    
+
     # Calculate effective batch size with gradient accumulation
     effective_batch_size = args.global_batch_size * args.gradient_accumulation_steps
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    
+
     rank = dist.get_rank()
     device = int(os.environ["LOCAL_RANK"])
     print(f"Found {n_gpus} GPUs, trying to use device index {device}")
@@ -269,7 +269,7 @@ def main(args):
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     local_batch_size = int(args.global_batch_size // dist.get_world_size())
-    
+
     if rank == 0:
         print(f"Global batch size: {args.global_batch_size}, Gradient accumulation steps: {args.gradient_accumulation_steps}")
         print(f"Effective batch size: {effective_batch_size}, Local batch size per GPU: {local_batch_size}")
@@ -360,18 +360,18 @@ def main(args):
     if args.use_muon:
         if not MUON_AVAILABLE:
             raise ImportError("Muon optimizer not available. Install it with: pip install muon")
-        
+
         logger.info("Using Muon optimizer for hidden weights")
-        
+
         # Categorize parameters for Muon
         # Hidden weights: 2D+ parameters in transformer blocks
         # Hidden gains/biases: 1D parameters in transformer blocks
         # Non-hidden: embeddings, timestep embedder, label embedder, patch embedder (optionally)
-        
+
         hidden_weights = []
         hidden_gains_biases = []
         nonhidden_params = []
-        
+
         # Transformer blocks contain the main hidden weights
         for block in model.blocks:
             for name, param in block.named_parameters():
@@ -379,18 +379,18 @@ def main(args):
                     hidden_weights.append(param)
                 else:
                     hidden_gains_biases.append(param)
-        
+
         # Final layer
         for name, param in model.final_layer.named_parameters():
             if param.ndim >= 2:
                 hidden_weights.append(param)
             else:
                 hidden_gains_biases.append(param)
-        
+
         # Embedders and patch projection
         nonhidden_params.extend(model.t_embedder.parameters())
         nonhidden_params.extend(model.y_embedder.parameters())
-        
+
         # Patch embedder: controlled by --muon-patch-embed flag
         if args.muon_patch_embed:
             for param in model.x_embedder.parameters():
@@ -400,21 +400,21 @@ def main(args):
                     nonhidden_params.append(param)
         else:
             nonhidden_params.extend(model.x_embedder.parameters())
-        
+
         # Positional embeddings (if not using RoPE)
         if hasattr(model, 'pos_embed'):
             nonhidden_params.append(model.pos_embed)
-        
+
         # RoPE parameters (if using RoPE)
         if args.use_rope:
             for block in model.blocks:
                 if hasattr(block, 'rope'):
                     nonhidden_params.extend(block.rope.parameters())
-        
+
         logger.info(f"Muon: {len(hidden_weights)} hidden weight tensors (2D+)")
         logger.info(f"AdamW: {len(hidden_gains_biases)} hidden gain/bias tensors (1D)")
         logger.info(f"AdamW: {len(nonhidden_params)} non-hidden parameter tensors")
-        
+
         param_groups = [
             dict(params=hidden_weights, use_muon=True,
                  lr=args.muon_lr, weight_decay=args.weight_decay),
@@ -440,7 +440,7 @@ def main(args):
         if 'model' in state_dict.keys():
             model_state = state_dict["model"]
             ema_state = state_dict["ema"]
-            
+
             # For 3D models, remove pos_embed_default if shapes don't match
             # This is safe because pos_embed is dynamically computed via get_pos_embed()
             if 'pos_embed_default' in model_state:
@@ -453,7 +453,7 @@ def main(args):
                         logger.info(f"      This is expected when using different num_frames at training vs checkpoint")
                     del model_state['pos_embed_default']
                     del ema_state['pos_embed_default']
-            
+
             model.load_state_dict(model_state, strict=False)
             ema.load_state_dict(ema_state, strict=False)
             opt.load_state_dict(state_dict["opt"])
@@ -461,7 +461,7 @@ def main(args):
         else:
             model_state = state_dict
             ema_state = state_dict
-            
+
             # Same for single state dict format
             if 'pos_embed_default' in model_state:
                 current_shape = model.state_dict()['pos_embed_default'].shape
@@ -472,7 +472,7 @@ def main(args):
                         logger.info(f"      Checkpoint shape: {ckpt_shape}, Current model shape: {current_shape}")
                         logger.info(f"      This is expected when using different num_frames at training vs checkpoint")
                     del model_state['pos_embed_default']
-                    
+
             model.load_state_dict(model_state, strict=False)
             ema.load_state_dict(ema_state, strict=False)
             scheduler_state = state_dict.get("scheduler")
@@ -481,7 +481,7 @@ def main(args):
         model = model.to(device)
     requires_grad(ema, False)
     model = DDP(model, device_ids=[device])
-    
+
     # Apply torch.compile if requested (PyTorch 2.0+)
     if args.use_compile:
         # Skip compile - it's not working and i'll figure it out later
@@ -492,7 +492,7 @@ def main(args):
         #     model = torch.compile(model)
         # else:
         #     logger.warning("torch.compile() not available (requires PyTorch 2.0+), skipping compilation")
-    
+
     transport = create_transport(
         args.path_type,
         args.prediction,
@@ -503,7 +503,7 @@ def main(args):
     transport_sampler = Sampler(transport)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"EqM Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
+
     # Load InceptionV3 for FID computation if enabled
     inception_model = None
     if args.compute_fid and rank == 0:
@@ -530,7 +530,7 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    
+
     # Custom collate function to handle variable-length video sequences
     # Determine the minimum temporal frames required by the model's patch embedding
     try:
@@ -584,7 +584,7 @@ def main(args):
         num_real_frames_batch = torch.tensor(num_real_frames, dtype=torch.long)
 
         return videos_batch, labels_batch, time_spans_batch, num_real_frames_batch
-    
+
     if getattr(args, 'video', False):
         # Create clip sampler if enabled
         clip_sampler = None
@@ -595,7 +595,7 @@ def main(args):
                 min_fraction=0.2,  # 20% of video duration
                 max_fraction=0.8   # 80% of video duration
             )
-        
+
         dataset = VideoDataset(
             args.data_path, 
             split='train', 
@@ -609,7 +609,7 @@ def main(args):
         )
     else:
         dataset = ImageFolder(args.data_path, transform=transform)
-    
+
     # Compute per-epoch batches and max training steps BEFORE creating the sampler/loader
     # This lets us compute curriculum phase lengths deterministically and create the sampler once.
     dataset_size = len(dataset)
@@ -706,7 +706,6 @@ def main(args):
             persistent_workers=True if args.num_workers > 0 else False,
             collate_fn=video_collate_fn if getattr(args, 'video', False) else None
         )
-    
 
     # Setup learning rate scheduler
     if args.lr_schedule == 'cosine':
@@ -716,7 +715,7 @@ def main(args):
             progress = step / max_train_steps
             min_factor = args.min_lr_factor
             return min_factor + (1 - min_factor) * (1 + math.cos(math.pi * progress)) / 2
-        
+
         scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=cosine_schedule)
     elif args.lr_schedule == 'linear':
         scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=args.min_lr_factor, total_iters=max_train_steps)
@@ -731,17 +730,17 @@ def main(args):
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
-    
+
     # Setup signal handler for graceful shutdown on Ctrl+C
     interrupted = False
-    
+
     def signal_handler(signum, frame):
         nonlocal interrupted
         interrupted = True
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     # For FID: accumulate real frame features
     real_features_accumulated = []
     real_features_collected = False  # Flag to collect real features only once
@@ -813,7 +812,7 @@ def main(args):
         else:
             # Non-curriculum: use stable estimate based on dataset_size/global batch size
             max_train_steps = args.epochs * per_gpu_batches_per_epoch
-    
+
     # Initialize optimizer gradients for gradient accumulation
     opt.zero_grad()
 
@@ -829,7 +828,7 @@ def main(args):
         # Update dataset frame sampling for current curriculum phase
         if args.use_curriculum and isinstance(dataset, VideoDataset):
             sampler.update_dataset_for_phase()
-        
+
         # logger.info(f"Beginning epoch {epoch}...")
         # Use a stable per-epoch batch count for the progress bar when using curriculum.
         # Curriculum phases can change the sampler's batch_size (per-GPU), which changes
@@ -949,38 +948,42 @@ def main(args):
             # Accumulate gradients
             scaler.scale(loss).backward()
             accumulation_counter += 1
-            
+
             # Only step optimizer after accumulating enough gradients
             if accumulation_counter >= args.gradient_accumulation_steps:
+                # --- Gradient Clipping ---
+                if args.grad_clip > 0:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad()
                 accumulation_counter = 0
-                
+
                 # Update EMA and scheduler only after actual optimizer step
                 update_ema(ema, model.module)
                 if scheduler:
                     scheduler.step()
-                
+
                 train_steps += 1
 
             # Log loss values (use unscaled loss for logging)
             running_loss += loss.item() * args.gradient_accumulation_steps
             log_steps += 1
-            
+
             # Generate samples (check before logging to ensure correct step order):
             if args.sample_every > 0 and train_steps % args.sample_every == 0 and train_steps > 0:
                 if rank == 0:
                     logger.info(f"Generating samples at step {train_steps}...")
                     ema.eval()
-                    
+
                     # Collect real features for FID (only once)
                     if args.compute_fid and not real_features_collected:
                         logger.info("Collecting real frame features for FID...")
                         real_features_list = []
                         frame_count = 0
                         target_samples = min(args.fid_num_samples, len(dataset))
-                        
+
                         # Process frames in chunks to reduce peak VRAM usage
                         for batch_data in loader:
                             if frame_count >= target_samples:
@@ -1013,18 +1016,18 @@ def main(args):
                             batch_features = get_inception_features(frames, inception_model, batch_size=32)
                             real_features_list.append(batch_features)
                             frame_count += frames.shape[0]
-                            
+
                             # Free memory immediately
                             del frames
                             torch.cuda.empty_cache()
-                        
+
                         # Concatenate all features (much smaller than raw frames)
                         real_features_accumulated = np.concatenate(real_features_list, axis=0)[:target_samples]
                         real_features_collected = True
                         logger.info(f"Collected {real_features_accumulated.shape[0]} real frame features")
                         del real_features_list
                         torch.cuda.empty_cache()
-                    
+
                     with torch.no_grad():
                         # Compute time_scale for video (temporal spacing between frames)
                         if getattr(args, 'video', False):
@@ -1038,11 +1041,11 @@ def main(args):
                             logger.info(f"Sampling with time_scale={time_scale_scalar:.6f} s/frame ({args.num_frames} frames over {args.sample_video_duration}s, pt={pt})")
                         else:
                             time_scale_scalar = 1.0
-                        
+
                         # Generate multiple batches for FID if needed
                         generated_frames_list = []
                         num_fid_batches = (args.fid_num_samples + local_batch_size - 1) // local_batch_size if args.compute_fid else 1
-                        
+
                         from tqdm import tqdm as _tqdm  # local alias to avoid shadowing outer tqdm usage
                         # Collect the first video from the first few fid batches so we can
                         # assemble a 4x4 logged grid (4 videos x 4 frames). We gather the
@@ -1060,27 +1063,27 @@ def main(args):
                                 zs_batch = torch.randn(local_batch_size, 4, args.num_frames, latent_size, latent_size, device=device) * 0.18215
                             else:
                                 zs_batch = torch.randn(local_batch_size, 4, latent_size, latent_size, device=device) * 0.18215
-                            
+
                             ys_batch = torch.randint(args.num_classes, size=(local_batch_size,), device=device)
-                            
+
                             if use_cfg:
                                 zs_batch = torch.cat([zs_batch, zs_batch], 0)
                                 y_null_batch = torch.tensor([args.num_classes] * local_batch_size, device=device)
                                 ys_batch = torch.cat([ys_batch, y_null_batch], 0)
-                            
+
                             xt = zs_batch.clone()
                             t = torch.ones((xt.shape[0],)).to(xt).to(device)
                             m = torch.zeros_like(xt).to(xt).to(device)
-                            
+
                             # Create time_scale tensor for this batch
                             batch_size_with_cfg = xt.shape[0]
                             time_scale_sample = torch.full((batch_size_with_cfg,), time_scale_scalar, device=device, dtype=torch.float32)
-                            
+
                             if use_cfg:
                                 sample_kwargs = dict(y=ys_batch, cfg_scale=args.cfg_scale, time_scale=time_scale_sample)
                             else:
                                 sample_kwargs = dict(y=ys_batch, time_scale=time_scale_sample)
-                            
+
                             # Use autocast for sampling
                             with autocast(device_type='cuda', dtype=autocast_dtype, enabled=args.use_amp or args.use_bf16):
                                 # Gradient descent sampling loop
@@ -1109,11 +1112,11 @@ def main(args):
                                         num_steps=args.num_sample_steps,
                                     )
                                     xt = sample_fn(zs_batch, model_fn, **sample_kwargs)[-1]
-                            
+
                             samples = xt
                             if use_cfg:
                                 samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-                            
+
                             # Decode samples from latent space
                             if getattr(args, 'video', False):
                                 # For video: decode all frames and prepare flattened labeled images
@@ -1138,7 +1141,7 @@ def main(args):
                                     first_batch_video_duration = None
                             else:
                                 samples_to_log = vae.decode(samples / 0.18215).sample
-                            
+
                             # Collect the first video from this fid batch (if video mode)
                             if getattr(args, 'video', False):
                                 # decoded_frames: (N, T, 3, H, W)
@@ -1157,20 +1160,20 @@ def main(args):
                                 # For images, keep the first fid batch for logging as before
                                 if fid_batch_idx == 0:
                                     first_batch_samples = samples_to_log.clone()
-                            
+
                             # For FID: extract features immediately to save VRAM
                             if args.compute_fid:
                                 batch_features = get_inception_features(samples_to_log, inception_model, batch_size=32)
                                 generated_frames_list.append(batch_features)
                             else:
                                 generated_frames_list.append(samples_to_log)
-                            
+
                             # Free memory
                             del samples, samples_to_log
                             if getattr(args, 'video', False):
                                 del samples_frames, decoded_frames
                             torch.cuda.empty_cache()
-                        
+
                         # After collecting videos from fid batches, assemble the first_batch_samples
                         # as the first video from the first `target_videos` batches (one row per video,
                         # `target_frames` columns). If needed, pad temporally or repeat videos to reach
@@ -1205,22 +1208,22 @@ def main(args):
                             logger.info("Computing FID...")
                             # Features were already extracted in the loop above
                             generated_features = np.concatenate(generated_frames_list, axis=0)[:args.fid_num_samples]
-                            
+
                             # Compute statistics
                             real_mu, real_sigma = compute_stats(real_features_accumulated)
                             gen_mu, gen_sigma = compute_stats(generated_features)
-                            
+
                             # Compute FID
                             fid_score = compute_fid_from_inception_stats(real_mu, real_sigma, gen_mu, gen_sigma)
                             logger.info(f"FID Score: {fid_score:.2f}")
-                            
+
                             # Clean up
                             del generated_features
                             torch.cuda.empty_cache()
-                        
+
                         logger.info(f"Samples generated")
                 dist.barrier()
-            
+
             # Log training metrics (and samples if generated at this step):
             # When using curriculum the per-GPU batch size may change across phases.
             # To keep the number of logs per epoch roughly constant, scale the
@@ -1251,7 +1254,7 @@ def main(args):
                     logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR_Muon: {current_lrs[0]:.6e}, LR_AdamW: {current_lrs[1]:.6e}")
                 else:
                     logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lrs[0]:.6e}")
-                
+
                 # Collect all wandb metrics to log at once
                 if args.wandb:
                     import wandb
@@ -1284,9 +1287,9 @@ def main(args):
                     if 'fid_score' in locals() and fid_score is not None:
                         log_dict["fid"] = fid_score
                         fid_score = None  # Clear for next time
-                    
+
                     wandb_utils.log(log_dict, step=train_steps)
-                
+
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -1383,6 +1386,7 @@ if __name__ == "__main__":
     parser.add_argument("--muon-patch-embed", action="store_true", help="Apply Muon to patch embedding projection layer (experimental)")
     parser.add_argument("--use-compile", action="store_true", help="Use torch.compile() for faster training (requires PyTorch 2.0+)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Number of gradient accumulation steps (allows larger effective batch size with less VRAM)")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Max norm for gradient clipping (0 to disable)")
 
     # Curriculum learning arguments
     parser.add_argument("--use-curriculum", action="store_true", help="Enable curriculum learning: automatically double frame count and halve batch size each phase (steps per phase computed from total training length)")
