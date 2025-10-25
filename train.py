@@ -925,13 +925,18 @@ def main(args):
                     # Map input images to latent space + normalize latents:
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
 
-            # Pass number of real PATCHES to the model (used for masking), not raw frames
+            # Pass number of real RAW FRAMES to the model (used for masking). The
+            # model's masking helper (`create_temporal_mask`) expects raw frame
+            # counts and will internally convert to patch counts. Previously we
+            # passed already-converted patch counts which caused only the first
+            # temporal patch to be marked valid (effectively freezing later
+            # frames). Use `num_real_frames` here to ensure correct masking.
             model_kwargs = dict(
                 y=y,
                 time_scale=time_scale,
                 return_act=args.disp,
                 train=True,
-                num_real_frames=num_real_patches if getattr(args, 'video', False) else None
+                num_real_frames=num_real_frames if getattr(args, 'video', False) else None
             )
 
             # Use automatic mixed precision if enabled

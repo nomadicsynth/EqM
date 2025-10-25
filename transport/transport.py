@@ -69,7 +69,6 @@ class Transport:
         N = th.prod(shape[1:])
         _fn = lambda x: -N / 2. * np.log(2 * np.pi) - th.sum(x ** 2) / 2.
         return th.vmap(_fn)(z)
-    
 
     def check_interval(
         self, 
@@ -94,19 +93,18 @@ class Transport:
 
             t0 = eps if (diffusion_form == "SBDM" and sde) or self.model_type != ModelType.VELOCITY else 0
             t1 = 1 - eps if (not sde or last_step_size == 0) else 1 - last_step_size
-        
+
         if reverse:
             t0, t1 = 1 - t0, 1 - t1
 
         return t0, t1
-
 
     def sample(self, x1):
         """Sampling x0 & t based on shape of x1 (if needed)
           Args:
             x1 - data point; [batch, *dim]
         """
-        
+
         x0 = th.randn_like(x1)
         t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
         t = th.rand((x1.shape[0],)) * (t1 - t0) + t0
@@ -139,7 +137,7 @@ class Transport:
         """
         if model_kwargs == None: 
             model_kwargs = {}
-        
+
         # Extract mask for variable-length sequences
         num_real_frames = model_kwargs.get('num_real_frames', None)
         attn_mask = None
@@ -148,11 +146,27 @@ class Transport:
             # x1 is (B, C, T, H, W) video tensor
             from models import create_temporal_mask
             B, C, T, H, W = x1.shape
-            # Assuming patch_size - we need grid_size to create mask
-            # For now, create a simple temporal mask
-            # TODO: Get actual patch sizes from model
-            attn_mask = create_temporal_mask(num_real_frames, (T, H, W), x1.device)
-        
+
+            # Try to read patch_size from the model (support DDP-wrapped model.module)
+            patch_size = None
+            if hasattr(model, "patch_size"):
+                patch_size = model.patch_size
+            elif hasattr(model, "module") and hasattr(model.module, "patch_size"):
+                patch_size = model.module.patch_size
+
+            # Fallback/default patch size = 1 if not found
+            if patch_size is None:
+                pt = ph = pw = 1
+            else:
+                if isinstance(patch_size, int):
+                    pt = ph = pw = patch_size
+                else:
+                    pt, ph, pw = patch_size
+
+            # Compute grid_size (temporal, height, width) in patches and pass patch_temporal
+            mask_grid_size = (T // pt, H // ph, W // pw)
+            attn_mask = create_temporal_mask(num_real_frames, mask_grid_size, x1.device, patch_temporal=pt)
+
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         # get_ct returns shape (B,) -- reshape to broadcast over ut's remaining dimensions
@@ -166,7 +180,7 @@ class Transport:
         if "return_act" in model_kwargs and model_kwargs['return_act']:
             model_output, act = model_output
             disp_loss = self.disp_loss(act[len(act)-1])
-        
+
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
@@ -185,14 +199,13 @@ class Transport:
                 weight = 1
             else:
                 raise NotImplementedError()
-            
+
             if self.model_type == ModelType.NOISE:
                 terms['loss'] = mean_flat_masked(weight * ((model_output - x0) ** 2), attn_mask)
             else:
                 terms['loss'] = mean_flat_masked(weight * ((model_output * sigma_t + x0) ** 2), attn_mask)
         terms['loss'] += 0.5*disp_loss      
         return terms
-    
 
     def get_drift(
         self
@@ -202,14 +215,14 @@ class Transport:
             drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
             model_output = model(x, t, **model_kwargs)
             return (-drift_mean + drift_var * model_output) # by change of variable
-        
+
         def noise_ode(x, t, model, **model_kwargs):
             drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))
             model_output = model(x, t, **model_kwargs)
             score = model_output / -sigma_t
             return (-drift_mean + drift_var * score)
-        
+
         def velocity_ode(x, t, model, **model_kwargs):
             model_output = model(x, t, **model_kwargs)
             return model_output
@@ -220,14 +233,13 @@ class Transport:
             drift_fn = score_ode
         else:
             drift_fn = velocity_ode
-        
+
         def body_fn(x, t, model, **model_kwargs):
             model_output = drift_fn(x, t, model, **model_kwargs)
             assert model_output.shape == x.shape, "Output shape from ODE solver must match input shape"
             return model_output
 
         return body_fn
-    
 
     def get_score(
         self,
@@ -242,7 +254,7 @@ class Transport:
             score_fn = lambda x, t, model, **kwargs: self.path_sampler.get_score_from_velocity(model(x, t, **kwargs), x, t)
         else:
             raise NotImplementedError()
-        
+
         return score_fn
 
 

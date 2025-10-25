@@ -71,7 +71,6 @@ class FinalLayer3D(nn.Module):
         return x
 
 
-
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -84,6 +83,7 @@ def create_temporal_mask(num_real_frames, grid_size, device, patch_temporal=1):
         num_real_frames: (B,) tensor of real frame counts per video
         grid_size: (t, h, w) tuple of patch grid dimensions
         device: torch device
+        patch_temporal: number of frames per temporal patch
     
     Returns:
         mask: (B, num_patches) boolean tensor where True = valid, False = padding
@@ -692,7 +692,7 @@ class EqM(nn.Module):
                 assert gs_t * gs_h * gs_w == num_patches, f"Cannot infer grid size: {num_patches} patches doesn't match grid {gs_t}x{gs_h}x{gs_w}"
             else:
                 gs_t, gs_h, gs_w = self.x_embedder.grid_size
-            
+
             N = x.shape[0]
             x = x.reshape(N, gs_t, gs_h, gs_w, pt, ph, pw, c)
             # reorder to (N, C, T, H, W)
@@ -758,10 +758,10 @@ class EqM(nn.Module):
         if self.uncond: # removes noise/time conditioning by setting to 0
             t = torch.zeros_like(t)
         act = []
-        
+
         # Embed patches
         x = self.x_embedder(x0)  # (N, num_patches, D)
-        
+
         # Compute actual grid size from input for dynamic positional embeddings
         if self.is3d:
             N, C, T, H, W = x0.shape
@@ -772,17 +772,17 @@ class EqM(nn.Module):
             actual_grid_size = (T // pt, H // ph, W // pw)
         else:
             actual_grid_size = None
-        
+
         # Add positional embedding if not using RoPE
         if not self.use_rope:
             pos_embed = self.get_pos_embed(time_scale, grid_size=actual_grid_size)
             x = x + pos_embed
-        
+
         # Get conditioning
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
-        
+
         # Get grid size for RoPE and masking
         if self.use_rope and self.is3d:
             # Dynamically compute grid size from input
@@ -797,7 +797,7 @@ class EqM(nn.Module):
             grid_size = (int(x.shape[1] ** 0.5), int(x.shape[1] ** 0.5))
         else:
             grid_size = None
-        
+
         # Create attention mask for variable-length sequences
         if self.is3d and grid_size is not None:
             N, C, T, H, W = x0.shape
@@ -806,10 +806,11 @@ class EqM(nn.Module):
             else:
                 pt, ph, pw = self.patch_size
             mask_grid_size = (T // pt, H // ph, W // pw)
-            attn_mask = create_temporal_mask(num_real_frames, mask_grid_size, x0.device)
+            # Pass the temporal patch size so masking is computed correctly
+            attn_mask = create_temporal_mask(num_real_frames, mask_grid_size, x0.device, patch_temporal=pt)
         else:
             attn_mask = None
-        
+
         # Sanity-check: ensure model patch_size matches patch embedder
         if self.is3d:
             embed_patch = self.x_embedder.patch_size
@@ -827,7 +828,7 @@ class EqM(nn.Module):
             else:
                 x = block(x, c, attn_mask=attn_mask, patch_size=self.x_embedder.patch_size)
             act.append(x)
-            
+
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:
@@ -967,14 +968,14 @@ def get_3d_sincos_pos_embed(embed_dim, grid_size, time_scale=1.0, cls_token=Fals
     grid_t = (np.arange(gt, dtype=np.float32) * pt + (pt - 1)) * time_scale
     grid_h = np.arange(gh, dtype=np.float32)
     grid_w = np.arange(gw, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h, grid_t, indexing='xy')  # w, h, t ordering
-    grid = np.stack(grid, axis=0)  # (3, W, H, T)
-    # reshape to (3, 1, T, H, W) to reuse 1d helpers
-    grid = grid.reshape([3, -1])
+    # Use t,h,w ordering to match PatchEmbed3D flatten and RoPE flattening
+    grid = np.meshgrid(grid_t, grid_h, grid_w, indexing="ij")  # t, h, w ordering
+    grid = np.stack(grid, axis=0)  # (3, T, H, W)
+    grid = grid.reshape([3, -1])  # (3, T*H*W)
     # We'll compute separate embeddings for t,h,w and concat
-    emb_t = get_1d_sincos_pos_embed_from_grid(embed_dim // 3 * 1, grid[2])
+    emb_t = get_1d_sincos_pos_embed_from_grid(embed_dim // 3 * 1, grid[0])
     emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 3 * 1, grid[1])
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim - emb_t.shape[1] - emb_h.shape[1], grid[0])
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim - emb_t.shape[1] - emb_h.shape[1], grid[2])
     emb = np.concatenate([emb_t, emb_h, emb_w], axis=1)
     if cls_token and extra_tokens > 0:
         emb = np.concatenate([np.zeros([extra_tokens, embed_dim]), emb], axis=0)
